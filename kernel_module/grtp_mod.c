@@ -7,10 +7,14 @@
 
 #include "grtp_mod.h"
 
-struct grtp_port {
+struct grtp_port_key {
 	__be32 addr;           /* IP Address     */
-       __be16 port;            /* port           */
-       struct rhash_head node; /* for hash table */
+	__be16 port;            /* port           */
+};
+
+struct grtp_port {
+	struct grtp_port_key key;
+	struct rhash_head node; /* for hash table */
 };
 static struct rhashtable grtp_port_table;
 static DEFINE_MUTEX(grtp_port_mutex);
@@ -22,8 +26,8 @@ static const struct net_proto_family grtp_family;
 static int grtp_port_table_init(void)
 {
 	struct rhashtable_params params = {
-		.key_len = sizeof(struct grtp_port),
-		.key_offset = offsetof(struct grtp_port, addr),
+		.key_len = sizeof(struct grtp_port_key),
+		.key_offset = offsetof(struct grtp_port, key),
 		.head_offset = offsetof(struct grtp_port, node),
 		.automatic_shrinking = true,
 	};
@@ -40,18 +44,13 @@ static int grtp_allocate_port(__be32 addr, __be16 port)
     if (!new_port)
         return -ENOMEM;
 
-    new_port->addr = addr;
-    new_port->port = port;
+    new_port->key.addr = addr;
+    new_port->key.port = port;
 
     mutex_lock(&grtp_port_mutex);
     ret = rhashtable_lookup_insert_fast(&grtp_port_table, &new_port->node,
                                         grtp_port_table.p);
-
-    int ret2 = rhashtable_lookup_insert_fast(&grtp_port_table, &new_port->node,
-                                        grtp_port_table.p);
     mutex_unlock(&grtp_port_mutex);
-
-    printk(KERN_INFO "grtp: looking up port %d gave %d result, with second %d\n", ntohs(port), ret, ret2);
 
     if (ret) {
         kfree(new_port);
@@ -64,13 +63,13 @@ static int grtp_allocate_port(__be32 addr, __be16 port)
 static void grtp_release_port(__be32 addr, __be16 port)
 {
     struct grtp_port *port_entry;
-    struct grtp_port search_port = {
+    struct grtp_port_key search_key = {
         .addr = addr,
         .port = port,
     };
 
     mutex_lock(&grtp_port_mutex);
-    port_entry = rhashtable_lookup_fast(&grtp_port_table, &search_port,
+    port_entry = rhashtable_lookup_fast(&grtp_port_table, &search_key,
                                        grtp_port_table.p);
     if (port_entry) {
         rhashtable_remove_fast(&grtp_port_table, &port_entry->node,
@@ -168,37 +167,37 @@ static int grtp_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	return 0;
 }
 
-static int grtp_connect(struct socket* sock, struct sockaddr* uaddr,
-			int alen, int flags)
-{
-	printk(KERN_INFO "grtp: grtp_connect");
-	return 0;
-}
-
-static int grtp_accept(struct socket *sock, struct socket *newsock,
-		       struct proto_accept_arg *arg)
-{
-	printk(KERN_INFO "grtp: grtp_accept");
-	return 0;
-}
-
-static int grtp_getname(struct socket *sock, struct sockaddr *uaddr, int peer)
-{
-	printk(KERN_INFO "grtp: grtp_getname");
-	return 0;
-}
-
-static int grtp_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
-{
-	printk(KERN_INFO "grtp: grtp_ioctl");
-	return 0;
-}
-
-static int grtp_listen(struct socket *sock, int backlog)
-{
-	printk(KERN_INFO "grtp: grtp_listen");
-	return 0;
-}
+// static int grtp_connect(struct socket* sock, struct sockaddr* uaddr,
+// 			int alen, int flags)
+// {
+// 	printk(KERN_INFO "grtp: grtp_connect");
+// 	return 0;
+// }
+//
+// static int grtp_accept(struct socket *sock, struct socket *newsock,
+// 		       struct proto_accept_arg *arg)
+// {
+// 	printk(KERN_INFO "grtp: grtp_accept");
+// 	return 0;
+// }
+//
+// static int grtp_getname(struct socket *sock, struct sockaddr *uaddr, int peer)
+// {
+// 	printk(KERN_INFO "grtp: grtp_getname");
+// 	return 0;
+// }
+//
+// static int grtp_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
+// {
+// 	printk(KERN_INFO "grtp: grtp_ioctl");
+// 	return 0;
+// }
+//
+// static int grtp_listen(struct socket *sock, int backlog)
+// {
+// 	printk(KERN_INFO "grtp: grtp_listen");
+// 	return 0;
+// }
 
 static int grtp_shutdown(struct socket *sock, int mode)
 {
@@ -206,26 +205,26 @@ static int grtp_shutdown(struct socket *sock, int mode)
 	return 0;
 }
 
-static int grtp_sendmsg(struct socket *sock, struct msghdr *msg,
-			       size_t len)
-{
-	printk(KERN_INFO "grtp: grtp_sendmsg");
-	return 0;
-}
-
-
-static int grtp_recvmsg(struct socket *sock, struct msghdr *msg,
-			       size_t size, int flags)
-{
-	printk(KERN_INFO "grtp: grtp_recvmsg");
-	return 0;
-}
-
-static int grtp_read_skb(struct sock *sk, skb_read_actor_t recv_actor)
-{
-	printk(KERN_INFO "grtp: grtp_read_skb");
-	return 0;
-}
+// static int grtp_sendmsg(struct socket *sock, struct msghdr *msg,
+// 			       size_t len)
+// {
+// 	printk(KERN_INFO "grtp: grtp_sendmsg");
+// 	return 0;
+// }
+//
+//
+// static int grtp_recvmsg(struct socket *sock, struct msghdr *msg,
+// 			       size_t size, int flags)
+// {
+// 	printk(KERN_INFO "grtp: grtp_recvmsg");
+// 	return 0;
+// }
+//
+// static int grtp_read_skb(struct sock *sk, skb_read_actor_t recv_actor)
+// {
+// 	printk(KERN_INFO "grtp: grtp_read_skb");
+// 	return 0;
+// }
 
 static void grtp_show_fdinfo(struct seq_file *m, struct socket *sock)
 {

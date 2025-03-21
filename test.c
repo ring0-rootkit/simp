@@ -42,8 +42,8 @@ int main()
     close(s1);
     close(s2);
 
-    int s3 = _bind(42069);
-    close(s3);
+    // int s3 = _bind(42069);
+    // close(s3);
 
     return 0;
 }
