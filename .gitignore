@@ -1,0 +1,8 @@
+**/grtp_mod.ko
+**/grtp_mod.mod.o
+**/modules.order
+**/grtp_mod.mod
+**/grtp_mod.o
+**/Module.symvers
+**/grtp_mod.mod.c
+**/.*
