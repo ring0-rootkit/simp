@@ -7,13 +7,8 @@
 
 #include "grtp_mod.h"
 
-struct grtp_port_key {
-	__be32 addr;           /* IP Address     */
-	__be16 port;            /* port           */
-};
-
 struct grtp_port {
-	struct grtp_port_key key;
+	__be16 port;
 	struct rhash_head node; /* for hash table */
 };
 static struct rhashtable grtp_port_table;
@@ -26,8 +21,8 @@ static const struct net_proto_family grtp_family;
 static int grtp_port_table_init(void)
 {
 	struct rhashtable_params params = {
-		.key_len = sizeof(struct grtp_port_key),
-		.key_offset = offsetof(struct grtp_port, key),
+		.key_len = sizeof(__be16),
+		.key_offset = offsetof(struct grtp_port, port),
 		.head_offset = offsetof(struct grtp_port, node),
 		.automatic_shrinking = true,
 	};
@@ -35,7 +30,7 @@ static int grtp_port_table_init(void)
 	return rhashtable_init(&grtp_port_table, &params);
 }
 
-static int grtp_allocate_port(__be32 addr, __be16 port)
+static int grtp_allocate_port(__be16 port)
 {
     struct grtp_port *new_port;
     int ret;
@@ -44,8 +39,7 @@ static int grtp_allocate_port(__be32 addr, __be16 port)
     if (!new_port)
         return -ENOMEM;
 
-    new_port->key.addr = addr;
-    new_port->key.port = port;
+    new_port->port = port;
 
     mutex_lock(&grtp_port_mutex);
     ret = rhashtable_lookup_insert_fast(&grtp_port_table, &new_port->node,
@@ -60,16 +54,13 @@ static int grtp_allocate_port(__be32 addr, __be16 port)
     return 0;
 }
 
-static void grtp_release_port(__be32 addr, __be16 port)
+static void grtp_release_port(__be16 port)
 {
     struct grtp_port *port_entry;
-    struct grtp_port_key search_key = {
-        .addr = addr,
-        .port = port,
-    };
+    __be16 search_port = port;
 
     mutex_lock(&grtp_port_mutex);
-    port_entry = rhashtable_lookup_fast(&grtp_port_table, &search_key,
+    port_entry = rhashtable_lookup_fast(&grtp_port_table, &search_port,
                                        grtp_port_table.p);
     if (port_entry) {
         rhashtable_remove_fast(&grtp_port_table, &port_entry->node,
@@ -114,7 +105,7 @@ static int grtp_release(struct socket *sock)
 	if (gaddr) {
 		printk(KERN_INFO "grtp: releasing address %pI4, port %d\n",
 			       &gaddr->sg_addr, ntohs(gaddr->sg_port));
-		grtp_release_port(gaddr->sg_addr.s_addr, gaddr->sg_port);
+		grtp_release_port(gaddr->sg_port);
 		kfree(gaddr);
 		sk->sk_user_data = NULL;
 	}
@@ -143,7 +134,7 @@ static int grtp_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		return -EAFNOSUPPORT;
 	}
 
-	ret = grtp_allocate_port(addr->sin_addr.s_addr, addr->sin_port);
+	ret = grtp_allocate_port(addr->sin_port);
 	if (ret) {
 		printk(KERN_ERR "grtp: port allocation failed\n");
 		return ret;
