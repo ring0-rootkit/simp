@@ -1,8 +1,5 @@
 obj-m += simp.o
-
 all:
-	mkdir build -p
-	cd build
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 
 clean:

@@ -1,9 +1,9 @@
-**/grtp_mod.ko
-**/grtp_mod.mod.o
+**/simp.ko
+**/simp.mod.o
 **/modules.order
-**/grtp_mod.mod
-**/grtp_mod.o
+**/simp.mod
+**/simp.o
 **/Module.symvers
-**/grtp_mod.mod.c
+**/simp.mod.c
 **/.*
 test
