@@ -26,5 +26,13 @@ int main(void) {
     return 1;
   }
 
-  while(1) {};
+  printf("before send\n");
+  err = simp_send(ctx, (const uint8_t *)"Test", 4, PRIO_HIGH, 0);
+  if (err < 0) {
+    perror("send");
+    simp_cleanup(ctx);
+    return 1;
+  }
+  printf("after send\n");
+  simp_cleanup(ctx);
 }

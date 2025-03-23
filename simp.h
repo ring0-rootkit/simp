@@ -93,11 +93,17 @@ typedef struct {
     pthread_t sender_thread;
     atomic_int connection_active;
     
+    pthread_mutex_t sock_write_mutex;
     pthread_mutex_t addr_mutex;
     pthread_mutex_t pack_info_mutex;
     pthread_mutex_t seq_mutex;
-    pthread_mutex_t read_mutex;
-    pthread_cond_t read_cond;
+    pthread_mutex_t read_mutex;           // also used for reader_closed_cond
+    pthread_mutex_t ka_mutex;             // keep alive
+    pthread_mutex_t sender_closed_mutex;  // for sender_closed_cond
+
+    pthread_cond_t keep_alive_closed_cond;
+    pthread_cond_t reader_closed_cond;
+    pthread_cond_t sender_closed_cond;
     
     atomic_uint_least16_t next_seq_id;
     atomic_uint_least16_t last_rcvd_id;
@@ -204,18 +210,23 @@ static simp_context_t* simp_create_shared_context(const char* name) {
     pthread_mutexattr_init(&mutex_attr);
     pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
     
+    pthread_mutex_init(&ctx->sock_write_mutex, &mutex_attr);
     pthread_mutex_init(&ctx->addr_mutex, &mutex_attr);
     pthread_mutex_init(&ctx->pack_info_mutex, &mutex_attr);
     pthread_mutex_init(&ctx->seq_mutex, &mutex_attr);
     pthread_mutex_init(&ctx->read_mutex, &mutex_attr);
+    pthread_mutex_init(&ctx->ka_mutex, &mutex_attr);
+    pthread_mutex_init(&ctx->sender_closed_mutex, &mutex_attr);
     
     pthread_mutexattr_destroy(&mutex_attr);
     
     pthread_condattr_t cond_attr;
     pthread_condattr_init(&cond_attr);
     pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
-    
-    pthread_cond_init(&ctx->read_cond, &cond_attr);
+
+    pthread_cond_init(&ctx->keep_alive_closed_cond, &cond_attr);
+    pthread_cond_init(&ctx->reader_closed_cond, &cond_attr);
+    pthread_cond_init(&ctx->sender_closed_cond, &cond_attr);
     
     pthread_condattr_destroy(&cond_attr);
     
@@ -228,58 +239,29 @@ static simp_context_t* simp_create_shared_context(const char* name) {
     return ctx;
 }
 
-static simp_context_t* simp_attach_shared_context(const char* name) {
-    if (name == NULL) {
-        ERR("No shared memory name provided");
-        return NULL;
-    }
-    
-    int shm_fd = shm_open(name, O_RDWR, 0666);
-    if (shm_fd == -1) {
-        ERR("shm_open (attach)");
-        return NULL;
-    }
-    
-    struct stat shm_stat;
-    if (fstat(shm_fd, &shm_stat) == -1) {
-        ERR("fstat");
-        close(shm_fd);
-        return NULL;
-    }
-    
-    if (shm_stat.st_size != sizeof(simp_context_t)) {
-        ERR("Shared memory size mismatch");
-        close(shm_fd);
-        return NULL;
-    }
-    
-    simp_context_t* ctx = (simp_context_t*)mmap(NULL, sizeof(simp_context_t), 
-                                              PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (ctx == MAP_FAILED) {
-        ERR("mmap (attach)");
-        close(shm_fd);
-        return NULL;
-    }
-    
-    ctx->shm_fd = shm_fd;
-    ctx->is_shm_owner = false;
-    
-    return ctx;
-}
-
 static void simp_detach_shared_context(simp_context_t* ctx) {
     if (ctx == NULL) return;
     
+    // Store local copies of the info we need for cleanup
+    // since we're about to unmap the memory
+    int shm_fd = ctx->shm_fd;
+    bool is_owner = ctx->is_shm_owner;
+    char shm_name[64];
+    strncpy(shm_name, ctx->shm_name, sizeof(shm_name));
+    
+    // Now unmap the shared memory
     if (munmap(ctx, sizeof(simp_context_t)) == -1) {
         ERR("munmap");
     }
     
-    if (close(ctx->shm_fd) == -1) {
+    // Close the file descriptor
+    if (close(shm_fd) == -1) {
         ERR("close (shm_fd)");
     }
     
-    if (ctx->is_shm_owner) {
-        if (shm_unlink(ctx->shm_name) == -1) {
+    // If this process is the owner, also unlink the shared memory
+    if (is_owner) {
+        if (shm_unlink(shm_name) == -1) {
             ERR("shm_unlink");
         }
     }
@@ -310,14 +292,23 @@ static int queue_pop(message_queue_t* queue, message_t* msg) {
     while (queue->count == 0) {
         pthread_cond_wait(&queue->not_empty, &queue->mutex);
     }
+
+    if (queue->count == -1) { // count set to -1 only in closing state
+        goto exit_error;
+    }
     
     memcpy(msg, &queue->messages[queue->head], sizeof(message_t));
     queue->head = (queue->head + 1) % MAX_QUEUE_SIZE;
     queue->count--;
-    
+
     pthread_cond_signal(&queue->not_full);
     pthread_mutex_unlock(&queue->mutex);
     return 0;
+
+exit_error:
+    pthread_cond_signal(&queue->not_full);
+    pthread_mutex_unlock(&queue->mutex);
+    return -1;
 }
 
 
@@ -390,8 +381,15 @@ static void buffer_cleanup(simp_context_t* ctx, uint16_t last_received_id,
                     };
                     simp_serialize_header(&header, buffer);
                     memcpy(buffer + HEADER_SIZE, msg.data, msg.data_len);
-                    sendto(ctx->sockfd, buffer, HEADER_SIZE + msg.data_len, 0,
+
+                    pthread_mutex_lock(&ctx->sock_write_mutex);
+                    int err = sendto(ctx->sockfd, buffer, HEADER_SIZE + msg.data_len, 0,
                           (struct sockaddr*)&local_addr, sizeof(local_addr));
+                    pthread_mutex_unlock(&ctx->sock_write_mutex);
+
+                    if (err < 0) {
+                        ERR("sendto");
+                    }
                 }
                 queue_push(&temp_queue, &msg);
             } else {
@@ -418,6 +416,8 @@ static void* sender_handler(void* arg) {
 
     while (atomic_load(&ctx->connection_active)) {
         if (queue_pop(&ctx->send_queue, &msg) == 0) {
+            printf("new packet to send\n");
+
             header.version = SIMP_VERSION;
             header.group_id = msg.group_id;
             header.seq_id = msg.seq_id;
@@ -430,15 +430,22 @@ static void* sender_handler(void* arg) {
             pthread_mutex_lock(&ctx->addr_mutex);
             local_addr = ctx->addr;
             pthread_mutex_unlock(&ctx->addr_mutex);
-            
+
+            pthread_mutex_lock(&ctx->sock_write_mutex);
             int err = sendto(ctx->sockfd, buffer, HEADER_SIZE + msg.data_len, 0,
                            (struct sockaddr*)&local_addr, sizeof(local_addr));
+            pthread_mutex_unlock(&ctx->sock_write_mutex);
+
             if (err < 0) {
                 ERR("sendto");
             }
         }
         usleep(1000);
     }
+
+    pthread_mutex_lock(&ctx->sender_closed_mutex);
+    pthread_cond_broadcast(&ctx->sender_closed_cond);
+    pthread_mutex_unlock(&ctx->sender_closed_mutex);
     return NULL;
 }
 
@@ -452,7 +459,7 @@ static void* simp_reader_handler(void* args) {
         socklen_t addr_len = sizeof(addr);
         ssize_t len = recvfrom(ctx->sockfd, buffer, MAX_PACKET_SIZE, 0, 
                               (struct sockaddr*)&addr, &addr_len);
-        if (len < 0) {
+        if (len < 0 && atomic_load(&ctx->connection_active)) {
             ERR("recvfrom");
             continue;
         }
@@ -507,20 +514,22 @@ static void* simp_reader_handler(void* args) {
             continue;
         }
 
+        printf("new packet with data: %s\n", (char*)data);
+
         msg.seq_id = header.seq_id;
         msg.flags = header.flags;
         msg.data_len = header.data_len;
         memcpy(msg.data, data, header.data_len);
         queue_push(&ctx->user_queue, &msg);
-
-        pthread_mutex_lock(&ctx->read_mutex);
-        pthread_cond_broadcast(&ctx->read_cond);
-        pthread_mutex_unlock(&ctx->read_mutex);
     }
+
+    pthread_mutex_lock(&ctx->read_mutex);
+    pthread_cond_broadcast(&ctx->reader_closed_cond);
+    pthread_mutex_unlock(&ctx->read_mutex);
     return NULL;
 }
 
-static int simp_receive(simp_context_t* ctx, char* buf, int buf_len) {
+static int simp_recv(simp_context_t* ctx, char* buf, int buf_len) {
     message_t msg;
     
     if (queue_pop(&ctx->user_queue, &msg) != 0) {
@@ -538,6 +547,8 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
         ERR("init");
         return -1;
     }
+
+    printf("created new socket, fd: %d\n", ctx->sockfd);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -560,11 +571,13 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     atomic_init(&ctx->pack_info, 0);
     atomic_init(&ctx->connection_active, 0);
     
+    pthread_mutex_init(&ctx->sock_write_mutex, NULL);
     pthread_mutex_init(&ctx->addr_mutex, NULL);
     pthread_mutex_init(&ctx->pack_info_mutex, NULL);
     pthread_mutex_init(&ctx->seq_mutex, NULL);
     pthread_mutex_init(&ctx->read_mutex, NULL);
-    pthread_cond_init(&ctx->read_cond, NULL);
+    pthread_mutex_init(&ctx->ka_mutex, NULL);
+    pthread_mutex_init(&ctx->sender_closed_mutex, NULL);
     
     queue_init(&ctx->reader_queue);
     queue_init(&ctx->nack_queue);
@@ -573,30 +586,6 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     queue_init(&ctx->pending_queue);
 
     return 0;
-}
-
-static void simp_cleanup(simp_context_t* ctx) {
-    atomic_store(&ctx->connection_active, 0);
-    
-    pthread_mutex_lock(&ctx->read_mutex);
-    pthread_cond_broadcast(&ctx->read_cond);
-    pthread_mutex_unlock(&ctx->read_mutex);
-    
-    close(ctx->sockfd);
-    
-    queue_cleanup(&ctx->reader_queue);
-    queue_cleanup(&ctx->nack_queue);
-    queue_cleanup(&ctx->user_queue);
-    queue_cleanup(&ctx->send_queue);
-    queue_cleanup(&ctx->pending_queue);
-    
-    pthread_mutex_destroy(&ctx->addr_mutex);
-    pthread_mutex_destroy(&ctx->pack_info_mutex);
-    pthread_mutex_destroy(&ctx->seq_mutex);
-    pthread_mutex_destroy(&ctx->read_mutex);
-    pthread_cond_destroy(&ctx->read_cond);
-    
-    simp_detach_shared_context(ctx);
 }
 
 static void* keep_alive_handler(void* arg) {
@@ -619,16 +608,17 @@ static void* keep_alive_handler(void* arg) {
         }
         pthread_mutex_unlock(&ctx->addr_mutex);
 
-
-        printf("loaded address: %s\n", inet_ntoa(local_addr.sin_addr));
-
         if (addr_valid) {
             keep_alive.seq_id = atomic_load(&ctx->last_acked_id);
 
             simp_serialize_header(&keep_alive, buffer);
             printf("sending KA packet\n");
+
+            pthread_mutex_lock(&ctx->sock_write_mutex);
             int err = sendto(ctx->sockfd, buffer, HEADER_SIZE, 0,
                   (struct sockaddr*)&local_addr, sizeof(local_addr));
+            pthread_mutex_unlock(&ctx->sock_write_mutex);
+
             if (err < 0) {
                 ERR("Keep alive send");
             }
@@ -636,6 +626,10 @@ static void* keep_alive_handler(void* arg) {
 
         sleep(KEEP_ALIVE_INTERVAL);
     }
+
+    pthread_mutex_lock(&ctx->ka_mutex);
+    pthread_cond_broadcast(&ctx->keep_alive_closed_cond);
+    pthread_mutex_unlock(&ctx->ka_mutex);
     return NULL;
 }
 
@@ -675,8 +669,11 @@ static void* nack_handler(void* arg) {
                         simp_serialize_header(&header, buffer);
                         memcpy(buffer + HEADER_SIZE, pending_msg.data, pending_msg.data_len);
                         
+                        pthread_mutex_lock(&ctx->sock_write_mutex);
                         int err = sendto(ctx->sockfd, buffer, HEADER_SIZE + pending_msg.data_len, 0,
                                       (struct sockaddr*)&local_addr, sizeof(local_addr));
+                        pthread_mutex_unlock(&ctx->sock_write_mutex);
+
                         if (err < 0) {
                             ERR("resend");
                         }
@@ -767,7 +764,6 @@ static int simp_connect(simp_context_t* ctx, const char* ip, uint16_t port) {
 
 static int simp_send(simp_context_t* ctx, const uint8_t* data, size_t len,
                     packet_priority_t prio, uint8_t group_id) {
-    if (prio == PRIO_LOW) return 0;
 
     packet_header_t header = {
         .version = SIMP_VERSION,
@@ -786,14 +782,86 @@ static int simp_send(simp_context_t* ctx, const uint8_t* data, size_t len,
     msg.priority = prio;
     memcpy(msg.data, data, len);
 
-    queue_push(&ctx->pending_queue, &msg);
-    
     queue_push(&ctx->send_queue, &msg);
+
+    queue_push(&ctx->pending_queue, &msg);
     return len;
 }
 
 static simp_context_t* simp_new() {
     return simp_create_shared_context(NULL);
 }
+
+static void simp_cleanup(simp_context_t* ctx) {
+
+    // TODO: send close packet
+    int err = simp_send(ctx, (uint8_t *)"CLOSE", 5, PRIO_HIGH, 0); // placeholder for actual close
+    if (err < 0) {
+        ERR("failed to send CLOSE packet\n");
+    }
+
+    pthread_mutex_lock(&ctx->send_queue.mutex);
+    while(ctx->send_queue.count > 0) {
+        pthread_cond_wait(&ctx->send_queue.not_full, &ctx->send_queue.mutex);
+    }
+    pthread_mutex_unlock(&ctx->send_queue.mutex);
+
+    // lock before setting connection state to 0, so nothing will exit before we can know
+    pthread_mutex_lock(&ctx->ka_mutex);
+    pthread_mutex_lock(&ctx->send_queue.mutex);
+    pthread_mutex_lock(&ctx->sender_closed_mutex);
+    pthread_mutex_lock(&ctx->read_mutex);
+    pthread_mutex_lock(&ctx->nack_queue.mutex);
+
+    atomic_store(&ctx->connection_active, 0);
+
+    // TODO: implement proper closing
+
+    pthread_cond_wait(&ctx->keep_alive_closed_cond, &ctx->ka_mutex);
+    pthread_mutex_unlock(&ctx->ka_mutex);
+
+    //make sender leave queue_pop with error by sending not_empty notification with count = -1
+    
+    ctx->send_queue.count = -1;
+    pthread_cond_broadcast(&ctx->send_queue.not_empty);
+    pthread_mutex_unlock(&ctx->send_queue.mutex);
+
+    ctx->nack_queue.count = -1;
+    pthread_cond_broadcast(&ctx->nack_queue.not_empty);
+    pthread_mutex_unlock(&ctx->nack_queue.mutex);
+
+    pthread_cond_wait(&ctx->sender_closed_cond, &ctx->sender_closed_mutex);
+    pthread_mutex_unlock(&ctx->sender_closed_mutex);
+    
+    // close sockeet before closing reader so reader can stop reading
+    // and can be notified
+    close(ctx->sockfd);
+
+    pthread_cond_wait(&ctx->reader_closed_cond, &ctx->read_mutex);
+    pthread_mutex_unlock(&ctx->read_mutex);
+    
+    queue_cleanup(&ctx->reader_queue);
+    queue_cleanup(&ctx->nack_queue);
+    queue_cleanup(&ctx->user_queue);
+    queue_cleanup(&ctx->send_queue);
+    queue_cleanup(&ctx->pending_queue);
+    
+    pthread_mutex_destroy(&ctx->sock_write_mutex);
+    pthread_mutex_destroy(&ctx->addr_mutex);
+    pthread_mutex_destroy(&ctx->pack_info_mutex);
+    pthread_mutex_destroy(&ctx->seq_mutex);
+    pthread_mutex_destroy(&ctx->read_mutex);
+    pthread_mutex_destroy(&ctx->ka_mutex);
+    pthread_mutex_destroy(&ctx->sender_closed_mutex);
+
+
+    pthread_cond_destroy(&ctx->keep_alive_closed_cond);
+    pthread_cond_destroy(&ctx->reader_closed_cond);
+    pthread_cond_destroy(&ctx->sender_closed_cond);
+    
+    simp_detach_shared_context(ctx);
+    printf("done\n");
+}
+
 
 #endif // SIMP_H
