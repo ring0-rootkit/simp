@@ -1,9 +1,4 @@
-**/simp.ko
-**/simp.mod.o
-**/modules.order
-**/simp.mod
-**/simp.o
-**/Module.symvers
-**/simp.mod.c
 **/.*
 test
+client
+server

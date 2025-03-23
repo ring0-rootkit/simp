@@ -1,28 +1,30 @@
 #include "simp.h"
+#include <signal.h>
+#include <pthread.h>
+#include <fcntl.h>
 
 int main(void) {
-  printf("pre init");
-  simp_context_t ctx;
-  printf("pre init");
-  int err = simp_init(&ctx, "127.0.0.1", 5000);
+  simp_context_t *ctx = simp_new();
+  if (!ctx) {
+    fprintf(stderr, "Failed to create shared memory context\n");
+    return 1;
+  }
+
+  int err = simp_init(ctx, "127.0.0.1", 5000);
   if (err) {
     perror("cannot init");
+    simp_cleanup(ctx);
+    return 1;
   }
-  printf("init");
-  err = simp_start(&ctx);
+  printf("init\n");
+
+  err = simp_start(ctx);
   if (err) {
-    perror("start");
+    perror("failed to start");
+    simp_cleanup(ctx);
+    return 1;
   }
-  printf("start");
-
   while(1) {};
-
-  char buf[11];
-  err = simp_receive(&ctx, buf, 11);
-  if (err < 0) {
-    perror("cannot receive data");
-  }
-  printf("%11s", buf);
-
+  
   return 0;
 }
