@@ -27,7 +27,7 @@ int main(void) {
   }
 
   printf("before send\n");
-  err = simp_send(ctx, (const uint8_t *)"Test", 4, PRIO_HIGH, 0);
+  err = simp_send(ctx, (const uint8_t *)"Test", 4, PRIO_HIGH, 1);
   if (err < 0) {
     perror("send");
     simp_cleanup(ctx);
