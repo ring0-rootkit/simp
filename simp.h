@@ -29,7 +29,10 @@
 #define RCVD_BUFFER_SIZE 128
 #define KEEP_ALIVE_INTERVAL 1
 #define KEEP_ALIVE_TIMEOUT 5
-#define MAX_MISSING_IDS 64
+
+// on update update size of pack_info in simp_context_t
+#define MAX_MISSING_IDS 64 
+
 #define MAX_QUEUE_SIZE 1024
 #define SIMP_SHM_NAME "/simp_context"
 #define RCV_TIMEOUT 1
@@ -115,7 +118,7 @@ typedef struct {
     atomic_uint_least16_t last_acked_id;
     atomic_uint_least8_t send_cntr;
     atomic_uint_least8_t rcvd_cntr;
-    atomic_uint_least8_t pack_info;
+    atomic_uint_least64_t pack_info;
 
     atomic_int should_send_ka_packet;
     atomic_int should_send_ka_resp;
@@ -179,6 +182,15 @@ static void queue_init(message_queue_t* queue) {
 static inline void simp_display_packet(simp_context_t *ctx, packet_header_t* header, uint8_t* data) {
     pthread_mutex_lock(&ctx->console_write_mutex);
     printf("\n┌──────────────────────────────────────┐\n");
+    printf("│ Context Information                  │\n");
+    printf("│ Last recvd: %d                        │\n", header->version);
+    printf("│ Last 32 packet bitmap:               │\n");
+    printf("│ ");
+    for (int i = sizeof(ctx->pack_info) * 8 / 2 - 1; i >= 0; i--) {
+        printf("%lu", (ctx->pack_info >> i) & 1);
+    }
+    printf("     │\n");
+    printf("├──────────────────────────────────────┤\n");
     printf("│ Packet Information                   │\n");
     printf("├──────────────────────────────────────┤\n");
     printf("│ Version: %d                           │\n", header->version);
@@ -524,6 +536,52 @@ static void* sender_handler(void* arg) {
     return NULL;
 }
 
+static void simp_send_nacks(simp_context_t *ctx) {
+    char buf[MAX_MISSING_IDS*2];
+    // go through pack_info, add all nacked to buf, send buf with trimming
+}
+
+static void simp_update_last_acked(simp_context_t *ctx) {
+    // go through pack_info from the end until first 0, and set last_acked to this number
+}
+
+/* 
+ * returns: non 0 if packet should be dropped 
+ * */
+static int simp_process_missed_packets(simp_context_t *ctx, packet_header_t *header) {
+    int should_drop = 1;
+
+    pthread_mutex_lock(&ctx->pack_info_mutex);
+    int packet_diff = header->seq_id - ctx->last_rcvd_id;
+    int pack_info = atomic_load(&ctx->pack_info);
+
+    if (packet_diff < 0) {
+        pack_info |= (1 << -packet_diff);
+        should_drop = 0;
+        goto done;
+    } 
+
+    // ensure that pack_info has 
+    // 'packet_diff' number of 1 in the leftmost position
+    int pack_diff_bitmap = (0xFFFFFFFF << (MAX_MISSING_IDS - packet_diff));
+    if ((pack_info & pack_diff_bitmap) == pack_diff_bitmap) {
+        pack_info = pack_info << packet_diff;
+        pack_info |= 1;
+        atomic_store(&ctx->last_rcvd_id, header->seq_id);
+        should_drop = 0;
+    }
+
+done:
+
+    atomic_store(&ctx->pack_info, pack_info);
+    pthread_mutex_unlock(&ctx->pack_info_mutex);
+
+    simp_send_nacks(ctx);
+    simp_update_last_acked(ctx);
+
+    return should_drop;
+}
+
 static void* simp_reader_handler(void* args) {
     simp_context_t *ctx = (simp_context_t*)args;
     uint8_t buffer[MAX_PACKET_SIZE];
@@ -560,36 +618,24 @@ static void* simp_reader_handler(void* args) {
         simp_deserialize_header(buffer, &header);
         void* data = buffer + HEADER_SIZE;
 
+        simp_process_missed_packets(ctx, &header);
+        // atomic_store(&ctx->last_rcvd_id, header.seq_id);
+        // resend nacks and set 
+        // atomic_store(&ctx->last_acked_id, last_acked);
+        // set last_acked to min(nack_id) - 1
+        // if none set to last_rcvd_id
+
         printf("---------------------------------\n");
         printf("RCV:\n");
         simp_display_packet(ctx, &header, data);
         printf("---------------------------------\n");
-
-        atomic_store(&ctx->last_rcvd_id, header.seq_id);
-        // resend nacks and set 
-        // set last_acked to min(nack_id) - 1
-        // if none set to last_rcvd_id
-        // atomic_store(&ctx->last_acked_id, last_acked);
 
         if(header.flags & FLAG_KEEP_ALIVE_REQ) {
             atomic_store(&ctx->should_send_ka_resp, 1);
         }
 
         if (header.flags & FLAG_KEEP_ALIVE_RESP) {
-            uint16_t last_acked = *(uint16_t*)data;
-            printf("KA resp, id: %d", last_acked);
-            uint16_t* nacked_ids = (uint16_t*)(data + sizeof(uint16_t));
-            size_t nacked_count = (header.data_len - sizeof(uint16_t)) / sizeof(uint16_t);
-            
-            if (nacked_count > 0) {
-                msg.seq_id = header.seq_id;
-                msg.ack_id = header.ack_id;
-                msg.flags = header.flags;
-                msg.data_len = header.data_len;
-                memcpy(msg.data, data, header.data_len);
-                queue_push(&ctx->nack_queue, &msg);
-            }
-            // if separate KA packet, skip it 
+            //TODO: reset ka skipped variable
         }
 
         if (header.flags & FLAG_NACK) {
@@ -670,7 +716,7 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     atomic_init(&ctx->rcvd_cntr, 0);
     atomic_init(&ctx->last_rcvd_id, 0);
     atomic_init(&ctx->last_acked_id, 0);
-    atomic_init(&ctx->pack_info, 0);
+    atomic_init(&ctx->pack_info, ~0);
     atomic_init(&ctx->connection_active, 0);
     
     pthread_mutex_init(&ctx->console_write_mutex, NULL);
