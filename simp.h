@@ -537,12 +537,29 @@ static void* sender_handler(void* arg) {
 }
 
 static void simp_send_nacks(simp_context_t *ctx) {
-    char buf[MAX_MISSING_IDS*2];
-    // go through pack_info, add all nacked to buf, send buf with trimming
+    // TODO: create NACK header
+    
+    char buf[MAX_MISSING_IDS*sizeof(ctx->seq_id)];
+    int buf_idx = 0;
+    pthread_mutex_lock(&ctx->pack_info_mutex);
+    uint16_t pack_info = atomic_load(&ctx->pack_info);
+    uint16_t cur_id = atomic_load(&ctx->last_recvd_id);
+    for(int i = 0; i < MAX_MISSING_IDS; i++) {
+        if(pack_info & (1<<i)) {
+           buf[buf_idx] = cur_id; 
+           buf_idx++;
+        }
+        cur_id--;
+    }
+    pthread_mutex_unlock(&ctx->pack_info_mutex);
+
+    pthread_mutex_lock(&ctx->nack_queue.mutex);
+    // TODO: construct NACK packet and add to nack queue
+    pthread_mutex_unlock(&ctx->nack_queue.mutex);
 }
 
 static void simp_update_last_acked(simp_context_t *ctx) {
-    // go through pack_info from the end until first 0, and set last_acked to this number
+    // TODO: go through pack_info from the end until first 0, and set last_acked to this number
 }
 
 /* 
