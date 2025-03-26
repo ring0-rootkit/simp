@@ -459,11 +459,9 @@ static void simp_send_nacks(simp_context_t *ctx) {
     }
     pthread_mutex_unlock(&ctx->pack_info_mutex);
 
-    pthread_mutex_lock(&ctx->nack_queue.mutex);
     keep_alive_msg.header.data_len = i*2; // 2 byte per packet_id
     memcpy(keep_alive_msg.data, buf, keep_alive_msg.header.data_len);
     queue_push(&ctx->nack_queue, &keep_alive_msg);
-    pthread_mutex_unlock(&ctx->nack_queue.mutex);
 }
 
 static void simp_update_last_acked(simp_context_t *ctx) {
@@ -486,7 +484,7 @@ static void simp_update_last_acked(simp_context_t *ctx) {
 /* 
  * returns: non 0 if packet should be dropped 
  * */
-static int simp_process_missed_packets(simp_context_t *ctx, packet_header_t *header) {
+static int simp_update_pack_info(simp_context_t *ctx, packet_header_t *header) {
     int should_drop = 1;
 
     pthread_mutex_lock(&ctx->pack_info_mutex);
@@ -507,15 +505,13 @@ static int simp_process_missed_packets(simp_context_t *ctx, packet_header_t *hea
         pack_info |= 1;
         atomic_store(&ctx->last_rcvd_id, header->seq_id);
         should_drop = 0;
+        goto done;
     }
 
 done:
 
     atomic_store(&ctx->pack_info, pack_info);
     pthread_mutex_unlock(&ctx->pack_info_mutex);
-
-    simp_send_nacks(ctx);
-    simp_update_last_acked(ctx);
 
     return should_drop;
 }
@@ -524,6 +520,7 @@ static void* simp_reader_handler(void* args) {
     simp_context_t *ctx = (simp_context_t*)args;
     uint8_t buffer[MAX_PACKET_SIZE];
     message_t msg;
+    int err;
 
     packet_header_t keep_alive_resp = {
         .version = SIMP_VERSION,
@@ -556,12 +553,17 @@ static void* simp_reader_handler(void* args) {
         simp_deserialize_header(buffer, &header);
         void* data = buffer + HEADER_SIZE;
 
-        simp_process_missed_packets(ctx, &header);
-        // atomic_store(&ctx->last_rcvd_id, header.seq_id);
-        // resend nacks and set 
-        // atomic_store(&ctx->last_acked_id, last_acked);
-        // set last_acked to min(nack_id) - 1
-        // if none set to last_rcvd_id
+        err = simp_update_pack_info(ctx, &header);
+        if (err) {
+            //drop the packet
+            printf("dropped packet with seq_id: %d\n", header.seq_id);
+            continue;
+        }
+
+        atomic_store(&ctx->last_rcvd_id, header.seq_id);
+
+        simp_send_nacks(ctx);
+        simp_update_last_acked(ctx);
 
         printf("---------------------------------\n");
         printf("RCV:\n");
@@ -592,7 +594,7 @@ static void* simp_reader_handler(void* args) {
             continue;
         }
 
-        printf("new packet with data: %s\n", (char*)data);
+        printf("new packet with data: %.*s\n", header.data_len, (char*)data);
 
         msg.header = header;
 

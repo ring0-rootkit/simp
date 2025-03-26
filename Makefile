@@ -9,10 +9,10 @@ all:
 run: run-server run-client
 
 run-server:
-	@tmux send-keys -t $(TMUX_PANE_0) "./server" C-m
+	@tmux send-keys -t $(TMUX_PANE_0) "clear && ./server" C-m
 
 run-client:
-	@tmux send-keys -t $(TMUX_PANE_1) "sleep 1 && ./client" C-m
+	@tmux send-keys -t $(TMUX_PANE_1) "clear && sleep 1 && ./client" C-m
 
 clean:
 	rm -f server client
