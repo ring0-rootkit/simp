@@ -61,22 +61,8 @@ typedef struct {
 #define HEADER_SIZE sizeof(packet_header_t)
 
 typedef struct {
-    uint16_t seq_id;
-    uint16_t ack_id;
-    uint8_t group_id;
-    packet_priority_t priority;
-    uint8_t data[MAX_PACKET_SIZE - HEADER_SIZE];
-    size_t data_len;
-    bool in_use;
-} buffered_packet_t;
-
-typedef struct {
     uint8_t data[MAX_PACKET_SIZE];
-    size_t data_len;
-    uint16_t seq_id;
-    uint16_t ack_id;
-    uint8_t group_id;
-    uint8_t flags;
+    packet_header_t header;
     packet_priority_t priority;
 } message_t;
 
@@ -178,12 +164,21 @@ static void queue_init(message_queue_t* queue) {
     pthread_condattr_destroy(&cond_attr);
 }
 
+static inline void simp_display_prep_line() {
+    printf("                                       │\r");
+    printf("│ ");
+}
 
+#define RIGHT_PAD_FORMATTED(msg, format) do {   \
+        simp_display_prep_line();               \
+        printf(msg, format);                    \
+        printf("\n");                           \
+    } while(0)
 static inline void simp_display_packet(simp_context_t *ctx, packet_header_t* header, uint8_t* data) {
     pthread_mutex_lock(&ctx->console_write_mutex);
     printf("\n┌──────────────────────────────────────┐\n");
     printf("│ Context Information                  │\n");
-    printf("│ Last recvd: %d                        │\n", header->version);
+    RIGHT_PAD_FORMATTED("Last rcvd: %d", header->version);
     printf("│ Last 32 packet bitmap:               │\n");
     printf("│ ");
     for (int i = sizeof(ctx->pack_info) * 8 / 2 - 1; i >= 0; i--) {
@@ -193,39 +188,41 @@ static inline void simp_display_packet(simp_context_t *ctx, packet_header_t* hea
     printf("├──────────────────────────────────────┤\n");
     printf("│ Packet Information                   │\n");
     printf("├──────────────────────────────────────┤\n");
-    printf("│ Version: %d                           │\n", header->version);
-    printf("│ Group ID: %d                          │\n", header->group_id);
-    printf("│ Sequence ID: %d                       │\n", header->seq_id);
-    printf("│ Acknowledgment ID: %d                 │\n", header->ack_id);
+    RIGHT_PAD_FORMATTED("Version: %d", header->version);
+    RIGHT_PAD_FORMATTED("Group ID: %d", header->group_id);
+    RIGHT_PAD_FORMATTED("Sequence ID: %d", header->seq_id);
+    RIGHT_PAD_FORMATTED("Acknowledgment ID: %d", header->ack_id);
     printf("│ Flags:                               │\n");
-    printf("│   Keep Alive Request: %s            │\n", 
+    RIGHT_PAD_FORMATTED("  Keep Alive Request: %s", 
            (header->flags & FLAG_KEEP_ALIVE_REQ) ? "Yes" : "No ");
-    printf("│   Keep Alive Response: %s           │\n", 
+    RIGHT_PAD_FORMATTED("  Keep Alive Response: %s", 
            (header->flags & FLAG_KEEP_ALIVE_RESP) ? "Yes" : "No ");
-    printf("│   NACK: %s                          │\n", 
+    RIGHT_PAD_FORMATTED("  NACK: %s", 
            (header->flags & FLAG_NACK) ? "Yes" : "No ");
-    printf("│ Data Length: %d bytes                 │\n", header->data_len);
+    RIGHT_PAD_FORMATTED("Data Length: %d bytes", header->data_len);
     printf("├──────────────────────────────────────┤\n");
     
     if (header->data_len > 0) {
         printf("│ Data:                                │\n");
-        printf("│ ");
+        simp_display_prep_line();
         for (int i = 0; i < header->data_len; i++) {
             printf("%02X ", data[i]);
-            if ((i + 1) % 16 == 0) {
-                printf("\n│ ");
+            if ((i + 1) % 8 == 0) {
+                printf("\n");
+                simp_display_prep_line();
             }
         }
-        if (header->data_len % 16 != 0) {
+        if (header->data_len % 8 != 0) {
             printf("\n");
         }
-        printf("└──────────────────────────────────────┘\n");
+        printf("\r└──────────────────────────────────────┘\n");
     } else {
         printf("│ No data payload                      │\n");
         printf("└──────────────────────────────────────┘\n");
     }
     pthread_mutex_unlock(&ctx->console_write_mutex);
 }
+#undef RIGHT_PAD_FORMATTED
 
 static simp_context_t* simp_create_shared_context(const char* name) {
     char shm_name[64];
@@ -379,104 +376,6 @@ exit_error:
     return -1;
 }
 
-
-static void buffer_add_packet(simp_context_t* ctx, const packet_header_t* header, 
-                             const uint8_t* data, packet_priority_t prio) {
-    if (prio == PRIO_LOW) return;
-
-    if (prio == PRIO_MEDIUM) {
-        message_t temp_msg;
-        message_queue_t temp_queue;
-        queue_init(&temp_queue);
-        
-        while (queue_pop(&ctx->pending_queue, &temp_msg) == 0) {
-            if (temp_msg.group_id == header->group_id && 
-                temp_msg.priority == PRIO_MEDIUM) {
-                continue;
-            }
-            queue_push(&temp_queue, &temp_msg);
-        }
-        
-        while (queue_pop(&temp_queue, &temp_msg) == 0) {
-            queue_push(&ctx->pending_queue, &temp_msg);
-        }
-        
-        queue_cleanup(&temp_queue);
-    }
-
-    message_t msg;
-    msg.seq_id = header->seq_id;
-    msg.ack_id = header->seq_id;
-    msg.group_id = header->group_id;
-    msg.priority = prio;
-    msg.data_len = header->data_len;
-    msg.flags = 0;
-    memcpy(msg.data, data, header->data_len);
-
-    queue_push(&ctx->pending_queue, &msg);
-    atomic_fetch_add(&ctx->send_cntr, 1);
-}
-
-static void buffer_cleanup(simp_context_t* ctx, uint16_t last_received_id, 
-                          const uint16_t* missing_ids, size_t missing_count) {
-    message_t msg;
-    message_queue_t temp_queue;
-    queue_init(&temp_queue);
-    struct sockaddr_in local_addr;
-    
-    pthread_mutex_lock(&ctx->addr_mutex);
-    local_addr = ctx->addr;
-    pthread_mutex_unlock(&ctx->addr_mutex);
-    
-    while (queue_pop(&ctx->pending_queue, &msg) == 0) {
-        if (msg.seq_id <= last_received_id) {
-            bool missing = false;
-            for (size_t j = 0; j < missing_count; j++) {
-                if (msg.seq_id == ntohs(missing_ids[j])) {
-                    missing = true;
-                    break;
-                }
-            }
-
-            if (missing) {
-                if (msg.priority == PRIO_HIGH || msg.priority == PRIO_MEDIUM) {
-                    uint8_t buffer[MAX_PACKET_SIZE];
-                    packet_header_t header = {
-                        .version = SIMP_VERSION,
-                        .group_id = msg.group_id,
-                        .seq_id = msg.seq_id,
-                        .ack_id = msg.ack_id,
-                        .data_len = msg.data_len,
-                        .flags = msg.flags
-                    };
-                    simp_serialize_header(&header, buffer);
-                    memcpy(buffer + HEADER_SIZE, msg.data, msg.data_len);
-
-                    pthread_mutex_lock(&ctx->sock_write_mutex);
-                    int err = sendto(ctx->sockfd, buffer, HEADER_SIZE + msg.data_len, 0,
-                          (struct sockaddr*)&local_addr, sizeof(local_addr));
-                    pthread_mutex_unlock(&ctx->sock_write_mutex);
-
-                    if (err < 0) {
-                        ERR("sendto");
-                    }
-                }
-                queue_push(&temp_queue, &msg);
-            } else {
-                atomic_fetch_sub(&ctx->send_cntr, 1);
-            }
-        } else {
-            queue_push(&temp_queue, &msg);
-        }
-    }
-    
-    while (queue_pop(&temp_queue, &msg) == 0) {
-        queue_push(&ctx->pending_queue, &msg);
-    }
-    
-    queue_cleanup(&temp_queue);
-}
-
 static void* sender_handler(void* arg) {
     simp_context_t* ctx = (simp_context_t*)arg;
     message_t msg;
@@ -488,12 +387,11 @@ static void* sender_handler(void* arg) {
         if (queue_pop(&ctx->send_queue, &msg) == 0) {
             printf("new packet to send\n");
 
-            header.version = SIMP_VERSION;
-            header.group_id = msg.group_id;
-            header.seq_id = msg.seq_id;
-            header.ack_id = atomic_load(&ctx->last_acked_id);
-            header.data_len = msg.data_len;
-            header.flags = msg.flags;
+            msg.header.version = SIMP_VERSION;
+            msg.header.seq_id = atomic_fetch_add(&ctx->next_seq_id, 1);
+            msg.header.ack_id = atomic_load(&ctx->last_acked_id);
+
+            header = msg.header;
 
             pthread_mutex_lock(&ctx->send_queue.mutex);
             if (atomic_load(&ctx->should_send_ka_packet)) {
@@ -507,7 +405,7 @@ static void* sender_handler(void* arg) {
             pthread_mutex_unlock(&ctx->send_queue.mutex);
             
             simp_serialize_header(&header, buffer);
-            memcpy(buffer + HEADER_SIZE, msg.data, msg.data_len);
+            memcpy(buffer + HEADER_SIZE, msg.data, msg.header.data_len);
             
             pthread_mutex_lock(&ctx->addr_mutex);
             local_addr = ctx->addr;
@@ -519,7 +417,7 @@ static void* sender_handler(void* arg) {
             printf("---------------------------------\n");
 
             pthread_mutex_lock(&ctx->sock_write_mutex);
-            int err = sendto(ctx->sockfd, buffer, HEADER_SIZE + msg.data_len, 0,
+            int err = sendto(ctx->sockfd, buffer, HEADER_SIZE + msg.header.data_len, 0,
                            (struct sockaddr*)&local_addr, sizeof(local_addr));
             pthread_mutex_unlock(&ctx->sock_write_mutex);
 
@@ -537,14 +435,22 @@ static void* sender_handler(void* arg) {
 }
 
 static void simp_send_nacks(simp_context_t *ctx) {
-    // TODO: create NACK header
+    message_t keep_alive_msg = {
+        .header = {
+            .version = SIMP_VERSION,
+            .flags = FLAG_NACK,
+            .data_len = 0
+        },
+        .priority = PRIO_HIGH,
+    };
     
-    char buf[MAX_MISSING_IDS*sizeof(ctx->seq_id)];
+    char buf[MAX_MISSING_IDS*sizeof(ctx->next_seq_id)];
     int buf_idx = 0;
     pthread_mutex_lock(&ctx->pack_info_mutex);
     uint16_t pack_info = atomic_load(&ctx->pack_info);
-    uint16_t cur_id = atomic_load(&ctx->last_recvd_id);
-    for(int i = 0; i < MAX_MISSING_IDS; i++) {
+    uint16_t cur_id = atomic_load(&ctx->last_rcvd_id);
+    int i;
+    for(i = 0; i < MAX_MISSING_IDS; i++) {
         if(pack_info & (1<<i)) {
            buf[buf_idx] = cur_id; 
            buf_idx++;
@@ -554,12 +460,27 @@ static void simp_send_nacks(simp_context_t *ctx) {
     pthread_mutex_unlock(&ctx->pack_info_mutex);
 
     pthread_mutex_lock(&ctx->nack_queue.mutex);
-    // TODO: construct NACK packet and add to nack queue
+    keep_alive_msg.header.data_len = i*2; // 2 byte per packet_id
+    memcpy(keep_alive_msg.data, buf, keep_alive_msg.header.data_len);
+    queue_push(&ctx->nack_queue, &keep_alive_msg);
     pthread_mutex_unlock(&ctx->nack_queue.mutex);
 }
 
 static void simp_update_last_acked(simp_context_t *ctx) {
-    // TODO: go through pack_info from the end until first 0, and set last_acked to this number
+    pthread_mutex_lock(&ctx->pack_info_mutex);
+    int last_rcvd = atomic_load(&ctx->last_rcvd_id);
+    int not_acked_num = last_rcvd - atomic_load(&ctx->last_acked_id);
+    int pack_info = atomic_load(&ctx->pack_info);
+    int mask = 1 << not_acked_num;
+    while(mask) {
+        if (!(pack_info & mask)) {
+            break;
+        }
+        last_rcvd++;
+        mask >>= 1;
+    }
+    atomic_store(&ctx->last_rcvd_id, last_rcvd);
+    pthread_mutex_unlock(&ctx->pack_info_mutex);
 }
 
 /* 
@@ -659,10 +580,8 @@ static void* simp_reader_handler(void* args) {
             uint16_t* missing_ids = (uint16_t*)data;
             size_t missing_count = (header.data_len - HEADER_SIZE) / sizeof(uint16_t);
             
-            msg.seq_id = header.seq_id;
-            msg.ack_id = header.ack_id;
-            msg.flags = header.flags;
-            msg.data_len = header.data_len;
+            msg.header = header;
+
             memcpy(msg.data, data, header.data_len);
             queue_push(&ctx->nack_queue, &msg);
             
@@ -675,10 +594,8 @@ static void* simp_reader_handler(void* args) {
 
         printf("new packet with data: %s\n", (char*)data);
 
-        msg.seq_id = header.seq_id;
-        msg.ack_id = header.ack_id;
-        msg.flags = header.flags;
-        msg.data_len = header.data_len;
+        msg.header = header;
+
         memcpy(msg.data, data, header.data_len);
         queue_push(&ctx->user_queue, &msg);
     }
@@ -696,7 +613,7 @@ static int simp_recv(simp_context_t* ctx, char* buf, int buf_len) {
         return -1;
     }
 
-    size_t copy_len = (msg.data_len < buf_len) ? msg.data_len : buf_len;
+    size_t copy_len = (msg.header.data_len < buf_len) ? msg.header.data_len : buf_len;
     memcpy(buf, msg.data, copy_len);
     return copy_len;
 }
@@ -827,7 +744,7 @@ static void* nack_handler(void* arg) {
     while (atomic_load(&ctx->connection_active)) {
         if (queue_pop(&ctx->nack_queue, &msg) == 0) {
             uint16_t* missing_ids = (uint16_t*)msg.data;
-            size_t missing_count = (msg.data_len - HEADER_SIZE) / sizeof(uint16_t);
+            size_t missing_count = (msg.header.data_len - HEADER_SIZE) / sizeof(uint16_t);
             
             pthread_mutex_lock(&ctx->addr_mutex);
             local_addr = ctx->addr;
@@ -843,19 +760,18 @@ static void* nack_handler(void* arg) {
                 queue_init(&temp_queue);
                 
                 while (queue_pop(&ctx->pending_queue, &pending_msg) == 0) {
-                    if (pending_msg.seq_id == nacked_id) {
+                    if (pending_msg.header.seq_id == nacked_id) {
+                        header = pending_msg.header;
+
                         header.version = SIMP_VERSION;
-                        header.group_id = pending_msg.group_id;
-                        header.seq_id = pending_msg.seq_id;
-                        header.ack_id = pending_msg.ack_id;
-                        header.data_len = pending_msg.data_len;
-                        header.flags = pending_msg.flags;
+                        header.seq_id = atomic_fetch_add(&ctx->next_seq_id, 1);
+                        header.ack_id = atomic_load(&ctx->last_acked_id);
                         
                         simp_serialize_header(&header, buffer);
-                        memcpy(buffer + HEADER_SIZE, pending_msg.data, pending_msg.data_len);
+                        memcpy(buffer + HEADER_SIZE, pending_msg.data, pending_msg.header.data_len);
                         
                         pthread_mutex_lock(&ctx->sock_write_mutex);
-                        int err = sendto(ctx->sockfd, buffer, HEADER_SIZE + pending_msg.data_len, 0,
+                        int err = sendto(ctx->sockfd, buffer, HEADER_SIZE + pending_msg.header.data_len, 0,
                                       (struct sockaddr*)&local_addr, sizeof(local_addr));
                         pthread_mutex_unlock(&ctx->sock_write_mutex);
 
@@ -950,22 +866,14 @@ static int simp_connect(simp_context_t* ctx, const char* ip, uint16_t port) {
 static int simp_send(simp_context_t* ctx, const uint8_t* data, size_t len,
                     packet_priority_t prio, uint8_t group_id) {
 
-    packet_header_t header = {
-        .version = SIMP_VERSION,
-        .group_id = group_id,
-        .data_len = (uint16_t)len,
-        .flags = 0
+    message_t msg = {
+        .header = {
+            .group_id = group_id,
+            .data_len = (uint16_t)len,
+            .flags = 0
+        },
+        .priority = prio,
     };
-
-    header.seq_id = atomic_fetch_add(&ctx->next_seq_id, 1);
-
-    message_t msg;
-    msg.seq_id = header.seq_id;
-    msg.ack_id = header.ack_id;
-    msg.group_id = header.group_id;
-    msg.data_len = header.data_len;
-    msg.flags = header.flags;
-    msg.priority = prio;
     memcpy(msg.data, data, len);
 
     queue_push(&ctx->send_queue, &msg);
