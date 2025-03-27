@@ -33,6 +33,12 @@ int main(void) {
     simp_cleanup(ctx);
     return 1;
   }
-  printf("after send\n");
+  err = simp_send(ctx, (const uint8_t *)"Test2", 5, PRIO_HIGH, 1);
+  if (err < 0) {
+    perror("send");
+    simp_cleanup(ctx);
+    return 1;
+  }
+  while(1){}
   simp_cleanup(ctx);
 }

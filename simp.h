@@ -385,11 +385,15 @@ static void* sender_handler(void* arg) {
 
     while (atomic_load(&ctx->connection_active)) {
         if (queue_pop(&ctx->send_queue, &msg) == 0) {
-            printf("new packet to send\n");
-
             msg.header.version = SIMP_VERSION;
             msg.header.seq_id = atomic_fetch_add(&ctx->next_seq_id, 1);
             msg.header.ack_id = atomic_load(&ctx->last_acked_id);
+
+            queue_push(&ctx->pending_queue, &msg);
+
+            if (msg.header.seq_id == 2) {
+                continue;
+            }
 
             header = msg.header;
 
@@ -439,45 +443,53 @@ static void simp_send_nacks(simp_context_t *ctx) {
         .header = {
             .version = SIMP_VERSION,
             .flags = FLAG_NACK,
-            .data_len = 0
         },
         .priority = PRIO_HIGH,
     };
     
-    char buf[MAX_MISSING_IDS*sizeof(ctx->next_seq_id)];
+    uint16_t buf[MAX_MISSING_IDS*sizeof(ctx->next_seq_id)];
     int buf_idx = 0;
     pthread_mutex_lock(&ctx->pack_info_mutex);
     uint16_t pack_info = atomic_load(&ctx->pack_info);
     uint16_t cur_id = atomic_load(&ctx->last_rcvd_id);
+    uint16_t last_acked = atomic_load(&ctx->last_acked_id);
     int i;
-    for(i = 0; i < MAX_MISSING_IDS; i++) {
-        if(pack_info & (1<<i)) {
-           buf[buf_idx] = cur_id; 
+    printf("last acked: %d cur_id: %d\n", last_acked, cur_id);
+    for(i = 0; i < MAX_MISSING_IDS && cur_id > last_acked; i++) {
+        printf("checking %d packet\n", i);
+        if(!(pack_info & (1<<i))) {
+            printf("found nack\n");
+            buf[buf_idx] = htons(cur_id); 
            buf_idx++;
         }
         cur_id--;
     }
     pthread_mutex_unlock(&ctx->pack_info_mutex);
 
-    keep_alive_msg.header.data_len = i*2; // 2 byte per packet_id
+    if (buf_idx == 0) {
+        return;
+    }
+
+    keep_alive_msg.header.data_len = buf_idx*2; // 2 byte per packet_id
     memcpy(keep_alive_msg.data, buf, keep_alive_msg.header.data_len);
-    queue_push(&ctx->nack_queue, &keep_alive_msg);
+    queue_push(&ctx->send_queue, &keep_alive_msg);
 }
 
 static void simp_update_last_acked(simp_context_t *ctx) {
     pthread_mutex_lock(&ctx->pack_info_mutex);
-    int last_rcvd = atomic_load(&ctx->last_rcvd_id);
-    int not_acked_num = last_rcvd - atomic_load(&ctx->last_acked_id);
+    int last_acked = atomic_load(&ctx->last_acked_id);
+    int not_acked_num = atomic_load(&ctx->last_rcvd_id) - last_acked;
     int pack_info = atomic_load(&ctx->pack_info);
     int mask = 1 << not_acked_num;
     while(mask) {
         if (!(pack_info & mask)) {
             break;
         }
-        last_rcvd++;
+        last_acked++;
         mask >>= 1;
     }
-    atomic_store(&ctx->last_rcvd_id, last_rcvd);
+    //TODO: delete from pengind queue
+    atomic_store(&ctx->last_acked_id, last_acked-1);
     pthread_mutex_unlock(&ctx->pack_info_mutex);
 }
 
@@ -560,7 +572,10 @@ static void* simp_reader_handler(void* args) {
             continue;
         }
 
-        atomic_store(&ctx->last_rcvd_id, header.seq_id);
+        int last_rcvd_id = atomic_load(&ctx->last_rcvd_id);
+        if (header.seq_id > last_rcvd_id) {
+            atomic_store(&ctx->last_rcvd_id, header.seq_id);
+        }
 
         simp_send_nacks(ctx);
         simp_update_last_acked(ctx);
@@ -579,6 +594,12 @@ static void* simp_reader_handler(void* args) {
         }
 
         if (header.flags & FLAG_NACK) {
+            printf("FOUND NACK PACKET\n");
+
+            if (header.seq_id < last_rcvd_id) {
+                continue;
+            }
+
             uint16_t* missing_ids = (uint16_t*)data;
             size_t missing_count = (header.data_len - HEADER_SIZE) / sizeof(uint16_t);
             
@@ -708,6 +729,7 @@ static void* keep_alive_handler(void* arg) {
             }
 
             keep_alive.seq_id = atomic_fetch_add(&ctx->next_seq_id, 1);
+            keep_alive.ack_id = atomic_load(&ctx->last_acked_id);
 
             simp_serialize_header(&keep_alive, buffer);
 
@@ -745,8 +767,10 @@ static void* nack_handler(void* arg) {
 
     while (atomic_load(&ctx->connection_active)) {
         if (queue_pop(&ctx->nack_queue, &msg) == 0) {
+            printf("found new NACK, restoring...\n");
+
             uint16_t* missing_ids = (uint16_t*)msg.data;
-            size_t missing_count = (msg.header.data_len - HEADER_SIZE) / sizeof(uint16_t);
+            size_t missing_count = msg.header.data_len / sizeof(uint16_t);
             
             pthread_mutex_lock(&ctx->addr_mutex);
             local_addr = ctx->addr;
@@ -758,15 +782,11 @@ static void* nack_handler(void* arg) {
                 message_t pending_msg;
                 bool found = false;
                 
-                message_queue_t temp_queue;
-                queue_init(&temp_queue);
-                
-                while (queue_pop(&ctx->pending_queue, &pending_msg) == 0) {
+                while (!found && queue_pop(&ctx->pending_queue, &pending_msg) == 0) {
                     if (pending_msg.header.seq_id == nacked_id) {
                         header = pending_msg.header;
 
                         header.version = SIMP_VERSION;
-                        header.seq_id = atomic_fetch_add(&ctx->next_seq_id, 1);
                         header.ack_id = atomic_load(&ctx->last_acked_id);
                         
                         simp_serialize_header(&header, buffer);
@@ -781,20 +801,14 @@ static void* nack_handler(void* arg) {
                             ERR("resend");
                         }
                         found = true;
-                    } else {
-                        queue_push(&temp_queue, &pending_msg);
-                    }
-                }
-                
-                while (queue_pop(&temp_queue, &pending_msg) == 0) {
+                    } 
                     queue_push(&ctx->pending_queue, &pending_msg);
                 }
-                
-                queue_cleanup(&temp_queue);
             }
         }
         usleep(10000);
     }
+    printf("nack queue closed\n");
     return NULL;
 }
 
@@ -879,8 +893,6 @@ static int simp_send(simp_context_t* ctx, const uint8_t* data, size_t len,
     memcpy(msg.data, data, len);
 
     queue_push(&ctx->send_queue, &msg);
-
-    queue_push(&ctx->pending_queue, &msg);
     return len;
 }
 
@@ -897,6 +909,7 @@ static void simp_cleanup(simp_context_t* ctx) {
     if (err < 0) {
         ERR("failed to send CLOSE packet\n");
     }
+    //TODO: wait for close accept
 
     fprintf(stdout, "Closing at %d: \n", __LINE__);
 

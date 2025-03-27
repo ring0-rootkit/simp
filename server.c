@@ -33,7 +33,15 @@ int main(void) {
     return 1;
   }
   printf("%.*s\n", len, buf);
-  while(1) {};
+  len = simp_recv(ctx, buf, 128);
+  if (len < 0) {
+    perror("read");
+    simp_cleanup(ctx);
+    return 1;
+  }
+  printf("%.*s\n", len, buf);
+
+  simp_cleanup(ctx);
   
   return 0;
 }
