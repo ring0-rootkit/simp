@@ -105,6 +105,7 @@ typedef struct {
     atomic_uint_least8_t send_cntr;
     atomic_uint_least8_t rcvd_cntr;
     atomic_uint_least64_t pack_info;
+    atomic_uint_least16_t next_avail_packet;
 
     atomic_int should_send_ka_packet;
     atomic_int should_send_ka_resp;
@@ -264,6 +265,7 @@ static simp_context_t* simp_create_shared_context(const char* name) {
     atomic_init(&ctx->send_cntr, 0);
     atomic_init(&ctx->rcvd_cntr, 0);
     atomic_init(&ctx->last_rcvd_id, 0);
+    atomic_init(&ctx->next_avail_packet, 1);
     atomic_init(&ctx->last_acked_id, 0);
     atomic_init(&ctx->pack_info, 0);
     atomic_init(&ctx->connection_active, 0);
@@ -397,7 +399,6 @@ static void* sender_handler(void* arg) {
 
             header = msg.header;
 
-            pthread_mutex_lock(&ctx->send_queue.mutex);
             if (atomic_load(&ctx->should_send_ka_packet)) {
                 atomic_store(&ctx->should_send_ka_packet, 0);
                 header.flags |= FLAG_KEEP_ALIVE_REQ;
@@ -406,7 +407,6 @@ static void* sender_handler(void* arg) {
                 atomic_store(&ctx->should_send_ka_resp, 0);
                 header.flags |= FLAG_KEEP_ALIVE_RESP;
             }
-            pthread_mutex_unlock(&ctx->send_queue.mutex);
             
             simp_serialize_header(&header, buffer);
             memcpy(buffer + HEADER_SIZE, msg.data, msg.header.data_len);
@@ -438,6 +438,7 @@ static void* sender_handler(void* arg) {
     return NULL;
 }
 
+//TODO: after 3 nack sends set packet as useless
 static void simp_send_nacks(simp_context_t *ctx) {
     message_t keep_alive_msg = {
         .header = {
@@ -565,6 +566,8 @@ static void* simp_reader_handler(void* args) {
         simp_deserialize_header(buffer, &header);
         void* data = buffer + HEADER_SIZE;
 
+        //TODO: if KA reset counter
+
         err = simp_update_pack_info(ctx, &header);
         if (err) {
             //drop the packet
@@ -619,6 +622,7 @@ static void* simp_reader_handler(void* args) {
 
         msg.header = header;
 
+        //TODO: fix user queue ordering
         memcpy(msg.data, data, header.data_len);
         queue_push(&ctx->user_queue, &msg);
     }
@@ -632,8 +636,13 @@ static void* simp_reader_handler(void* args) {
 static int simp_recv(simp_context_t* ctx, char* buf, int buf_len) {
     message_t msg;
     
-    if (queue_pop(&ctx->user_queue, &msg) != 0) {
-        return -1;
+    while (queue_pop(&ctx->user_queue, &msg)) {
+        if (msg.header.seq_id == atomic_load(&ctx->next_avail_packet)) {
+            atomic_fetch_add(&ctx->next_avail_packet, 1);
+            break;
+        } else {
+            queue_push(&ctx->user_queue, &msg);
+        }
     }
 
     size_t copy_len = (msg.header.data_len < buf_len) ? msg.header.data_len : buf_len;
@@ -672,6 +681,7 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     atomic_init(&ctx->send_cntr, 0);
     atomic_init(&ctx->rcvd_cntr, 0);
     atomic_init(&ctx->last_rcvd_id, 0);
+    atomic_init(&ctx->next_avail_packet, 1);
     atomic_init(&ctx->last_acked_id, 0);
     atomic_init(&ctx->pack_info, ~0);
     atomic_init(&ctx->connection_active, 0);
@@ -707,6 +717,7 @@ static void* keep_alive_handler(void* arg) {
     bool addr_valid;
 
     while (atomic_load(&ctx->connection_active)) {
+        printf("KA alive\n");
         pthread_mutex_lock(&ctx->addr_mutex);
         addr_valid = ctx->addr.sin_family != 0;
         if (addr_valid) {
@@ -715,14 +726,11 @@ static void* keep_alive_handler(void* arg) {
         pthread_mutex_unlock(&ctx->addr_mutex);
 
         pthread_mutex_lock(&ctx->send_queue.mutex);
-        if (ctx->send_queue.count != 0) {
-            atomic_store(&ctx->should_send_ka_packet, 1);
-        }
+        atomic_store(&ctx->should_send_ka_packet, (ctx->send_queue.count != 0));
         pthread_mutex_unlock(&ctx->send_queue.mutex);
 
+        printf("before if with addr_valid:%b, and should_send_ka: %b\n", addr_valid, atomic_load(&ctx->should_send_ka_packet));
         if (addr_valid && !atomic_load(&ctx->should_send_ka_packet)) {
-            keep_alive.seq_id = atomic_load(&ctx->last_acked_id);
-
             if (atomic_load(&ctx->should_send_ka_resp)) {
                 atomic_store(&ctx->should_send_ka_resp, 0);
                 keep_alive.flags |= FLAG_KEEP_ALIVE_RESP;
