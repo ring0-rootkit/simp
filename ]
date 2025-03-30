@@ -589,10 +589,6 @@ static void* simp_reader_handler(void* args) {
         void* data = buffer + HEADER_SIZE;
 
         //TODO: if KA reset counter
-        if (header.flags & FLAG_KEEP_ALIVE_RESP) {
-            //TODO: reset ka skipped variable
-        }
-
 
         err = simp_update_pack_info(ctx, &header);
         if (err) {
@@ -623,6 +619,10 @@ static void* simp_reader_handler(void* args) {
 
         if(header.flags & FLAG_KEEP_ALIVE_REQ) {
             atomic_store(&ctx->should_send_ka_resp, 1);
+        }
+
+        if (header.flags & FLAG_KEEP_ALIVE_RESP) {
+            //TODO: reset ka skipped variable
         }
 
         if (header.flags & FLAG_NACK) {
@@ -664,7 +664,7 @@ static void* simp_reader_handler(void* args) {
 static int simp_recv(simp_context_t* ctx, char* buf, int buf_len) {
     message_t msg;
     
-    while (queue_pop(&ctx->user_queue, &msg) == 0) {
+    while (queue_pop(&ctx->user_queue, &msg)) {
         if (msg.header.seq_id == atomic_load(&ctx->next_avail_packet)) {
             atomic_fetch_add(&ctx->next_avail_packet, 1);
             break;
