@@ -29,6 +29,7 @@
 #define RCVD_BUFFER_SIZE 128
 #define KEEP_ALIVE_INTERVAL 1
 #define KEEP_ALIVE_TIMEOUT 5
+#define MAX_NACKS_BEFORE_DROP 3
 
 // on update update size of pack_info in simp_context_t
 #define MAX_MISSING_IDS 64 
@@ -95,6 +96,7 @@ typedef struct {
     pthread_mutex_t ka_mutex;             // keep alive
     pthread_mutex_t sender_closed_mutex;  // for sender_closed_cond
     pthread_mutex_t last_remotely_acked_mutex;
+    pthread_mutex_t nacks_sent_mutex;
 
     pthread_cond_t keep_alive_closed_cond;
     pthread_cond_t reader_closed_cond;
@@ -112,6 +114,7 @@ typedef struct {
     atomic_int should_send_ka_packet;
     atomic_int should_send_ka_resp;
     atomic_uint_least8_t missed_ka_num; // number of missed keep alive packets
+    char nacks_sent[64];
     
     message_queue_t reader_queue;
     message_queue_t nack_queue;
@@ -287,6 +290,7 @@ static simp_context_t* simp_create_shared_context(const char* name) {
     pthread_mutex_init(&ctx->ka_mutex, &mutex_attr);
     pthread_mutex_init(&ctx->sender_closed_mutex, &mutex_attr);
     pthread_mutex_init(&ctx->last_remotely_acked_mutex, &mutex_attr);
+    pthread_mutex_init(&ctx->nacks_sent_mutex, &mutex_attr);
     
     pthread_mutexattr_destroy(&mutex_attr);
     
@@ -381,6 +385,10 @@ exit_error:
     return -1;
 }
 
+// TODO: implement
+static void clear_group_from_queue(message_queue_t *queue, uint16_t group_id) {
+}
+
 static void* sender_handler(void* arg) {
     simp_context_t* ctx = (simp_context_t*)arg;
     message_t msg;
@@ -394,7 +402,9 @@ static void* sender_handler(void* arg) {
             msg.header.seq_id = atomic_fetch_add(&ctx->next_seq_id, 1);
             msg.header.ack_id = atomic_load(&ctx->last_acked_id);
 
-            queue_push(&ctx->pending_queue, &msg);
+            if (msg.priority == PRIO_HIGH) {
+                queue_push(&ctx->pending_queue, &msg);
+            }
 
             if (msg.header.seq_id == 2) {
                 continue;
@@ -441,7 +451,8 @@ static void* sender_handler(void* arg) {
     return NULL;
 }
 
-//TODO: after 3 nack sends set packet as useless
+//TODO(test): after 3 nack sends set packet as useless
+// TODO(urgent): Why TF it sets 16 bits to 0????
 static void simp_send_nacks(simp_context_t *ctx) {
     message_t keep_alive_msg = {
         .header = {
@@ -459,16 +470,31 @@ static void simp_send_nacks(simp_context_t *ctx) {
     uint16_t last_acked = atomic_load(&ctx->last_acked_id);
     int i;
     printf("last acked: %d cur_id: %d\n", last_acked, cur_id);
+
+    pthread_mutex_lock(&ctx->nacks_sent_mutex);
     for(i = 0; i < MAX_MISSING_IDS && cur_id > last_acked; i++) {
         printf("checking %d packet\n", i);
         if(!(pack_info & (1<<i))) {
             printf("found nack\n");
-            buf[buf_idx] = htons(cur_id); 
-           buf_idx++;
+
+            int next = atomic_load(&ctx->next_avail_packet);
+            if (ctx->nacks_sent[next & 0x7F] >= MAX_NACKS_BEFORE_DROP) {
+                ctx->nacks_sent[next & 0x7F] = 0;
+                atomic_store(&ctx->next_avail_packet, next+1);
+                pack_info |= (1<<i);
+            }
+
+            ctx->nacks_sent[cur_id&0x7F]++;
+            if (ctx->nacks_sent[cur_id&0x7F] < MAX_NACKS_BEFORE_DROP) {
+                buf[buf_idx] = htons(cur_id); 
+                buf_idx++;
+            }
         }
         cur_id--;
     }
+    atomic_store(&ctx->pack_info, pack_info);
     pthread_mutex_unlock(&ctx->pack_info_mutex);
+    pthread_mutex_unlock(&ctx->nacks_sent_mutex);
 
     if (buf_idx == 0) {
         return;
@@ -711,7 +737,7 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     atomic_init(&ctx->last_rcvd_id, 0);
     atomic_init(&ctx->next_avail_packet, 1);
     atomic_init(&ctx->last_acked_id, 0);
-    atomic_init(&ctx->pack_info, ~0);
+    atomic_init(&ctx->pack_info, 0xFFFFFFFF);
     atomic_init(&ctx->connection_active, 0);
     
     pthread_mutex_init(&ctx->console_write_mutex, NULL);
@@ -723,6 +749,7 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     pthread_mutex_init(&ctx->ka_mutex, NULL);
     pthread_mutex_init(&ctx->sender_closed_mutex, NULL);
     pthread_mutex_init(&ctx->last_remotely_acked_mutex, NULL);
+    pthread_mutex_init(&ctx->nacks_sent_mutex, NULL);
     
     queue_init(&ctx->reader_queue);
     queue_init(&ctx->nack_queue);
@@ -1025,6 +1052,7 @@ static void simp_cleanup(simp_context_t* ctx) {
     pthread_mutex_destroy(&ctx->ka_mutex);
     pthread_mutex_destroy(&ctx->sender_closed_mutex);
     pthread_mutex_destroy(&ctx->last_remotely_acked_mutex);
+    pthread_mutex_destroy(&ctx->nacks_sent_mutex);
 
     fprintf(stdout, "Closing at %d: \n", __LINE__);
 

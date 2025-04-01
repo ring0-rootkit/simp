@@ -33,7 +33,7 @@ int main(void) {
     simp_cleanup(ctx);
     return 1;
   }
-  err = simp_send(ctx, (const uint8_t *)"Test2", 5, PRIO_HIGH, 1);
+  err = simp_send(ctx, (const uint8_t *)"Test2", 5, PRIO_LOW, 1);
   if (err < 0) {
     perror("send");
     simp_cleanup(ctx);
