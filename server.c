@@ -40,13 +40,6 @@ int main(void) {
     return 1;
   }
   printf("packet2: %.*s\n", len, buf);
-  len = simp_recv(ctx, buf, 128);
-  if (len < 0) {
-    perror("read");
-    simp_cleanup(ctx);
-    return 1;
-  }
-  printf("packet 3: %.*s\n", len, buf);
 
   simp_cleanup(ctx);
   

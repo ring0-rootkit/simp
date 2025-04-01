@@ -6,7 +6,7 @@ all:
 	clang server.c -o server -pthread -lrt
 	clang client.c -o client -pthread -lrt
 
-run: run-server run-client
+run: all run-server run-client
 
 run-server:
 	@tmux send-keys -t $(TMUX_PANE_0) "clear && ./server" C-m

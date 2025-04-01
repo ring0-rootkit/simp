@@ -272,7 +272,7 @@ static simp_context_t* simp_create_shared_context(const char* name) {
     atomic_init(&ctx->last_rcvd_id, 0);
     atomic_init(&ctx->next_avail_packet, 1);
     atomic_init(&ctx->last_acked_id, 0);
-    atomic_init(&ctx->pack_info, 0);
+    atomic_init(&ctx->pack_info, 0xFFFFFFFF);
     atomic_init(&ctx->connection_active, 0);
     atomic_init(&ctx->should_send_ka_packet, 0);
     atomic_init(&ctx->should_send_ka_resp, 0);
@@ -465,7 +465,7 @@ static void simp_send_nacks(simp_context_t *ctx) {
     uint16_t buf[MAX_MISSING_IDS*sizeof(ctx->next_seq_id)];
     int buf_idx = 0;
     pthread_mutex_lock(&ctx->pack_info_mutex);
-    uint16_t pack_info = atomic_load(&ctx->pack_info);
+    uint32_t pack_info = atomic_load(&ctx->pack_info);
     uint16_t cur_id = atomic_load(&ctx->last_rcvd_id);
     uint16_t last_acked = atomic_load(&ctx->last_acked_id);
     int i;
@@ -481,7 +481,7 @@ static void simp_send_nacks(simp_context_t *ctx) {
             if (ctx->nacks_sent[next & 0x7F] >= MAX_NACKS_BEFORE_DROP) {
                 ctx->nacks_sent[next & 0x7F] = 0;
                 atomic_store(&ctx->next_avail_packet, next+1);
-                pack_info |= (1<<i);
+                pack_info = pack_info | (1<<i);
             }
 
             ctx->nacks_sent[cur_id&0x7F]++;
