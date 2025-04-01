@@ -45,6 +45,6 @@ int main(void) {
     simp_cleanup(ctx);
     return 1;
   }
-  while(1){}
+  while(simp_is_connected(ctx)){usleep(1000);}
   simp_cleanup(ctx);
 }

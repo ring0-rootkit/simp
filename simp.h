@@ -32,6 +32,8 @@
 #define MAX_NACKS_BEFORE_DROP 3
 #define MAX_KEEP_ALIVE_MISSES 5
 
+#define ERR_CLOSED 7
+
 // on update update size of pack_info in simp_context_t
 #define MAX_MISSING_IDS 64 
 
@@ -86,6 +88,7 @@ typedef struct {
     pthread_t nack_handler_thread;
     pthread_t sender_thread;
     atomic_int connection_active;
+    atomic_int remote_peer_active;
 
     pthread_mutex_t console_write_mutex;
     
@@ -277,6 +280,7 @@ static simp_context_t* simp_create_shared_context(const char* name) {
     atomic_init(&ctx->last_acked_id, 0);
     atomic_init(&ctx->pack_info, 0xFFFFFFFF);
     atomic_init(&ctx->connection_active, 0);
+    atomic_init(&ctx->remote_peer_active, 0);
     atomic_init(&ctx->should_send_ka_packet, 0);
     atomic_init(&ctx->should_send_ka_resp, 0);
     
@@ -691,7 +695,11 @@ static void* simp_reader_handler(void* args) {
     return NULL;
 }
 
+// returns: ERR_CLOSED if connection has already been closed by remote peer
 static int simp_recv(simp_context_t* ctx, char* buf, int buf_len) {
+    if (!atomic_load(&ctx->remote_peer_active)) {
+        return -ERR_CLOSED;
+    }
     message_t msg;
     
     while (queue_pop(&ctx->user_queue, &msg) == 0) {
@@ -744,6 +752,7 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     atomic_init(&ctx->last_acked_id, 0);
     atomic_init(&ctx->pack_info, 0xFFFFFFFF);
     atomic_init(&ctx->connection_active, 0);
+    atomic_init(&ctx->remote_peer_active, 0);
     
     pthread_mutex_init(&ctx->console_write_mutex, NULL);
     pthread_mutex_init(&ctx->sock_write_mutex, NULL);
@@ -765,9 +774,13 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     return 0;
 }
 
+// returns: ERR_CLOSED if connection has already been closed by remote peer
 static int simp_send(simp_context_t* ctx, const uint8_t* data, size_t len,
                     packet_priority_t prio, uint8_t group_id) {
 
+    if (!atomic_load(&ctx->remote_peer_active)) {
+        return -ERR_CLOSED;
+    }
     message_t msg = {
         .header = {
             .group_id = group_id,
@@ -785,14 +798,17 @@ static int simp_send(simp_context_t* ctx, const uint8_t* data, size_t len,
 
 static void simp_cleanup(simp_context_t* ctx) {
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-    // TODO: send close packet
-    int err = simp_send(ctx, (uint8_t *)"CLOSE", 5, PRIO_HIGH, 0); // placeholder for actual close
-    if (err < 0) {
-        ERR("failed to send CLOSE packet\n");
+    if (ctx == NULL) {
+        return;
     }
-    //TODO: wait for close accept
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    //
+    // int err = simp_send(ctx, (uint8_t *)"CLOSE", 5, PRIO_HIGH, -1); // placeholder for actual close
+    // if (err < 0) {
+    //     ERR("failed to send CLOSE packet\n");
+    // }
+    // //TODO: wait for close accept
 
     fprintf(stdout, "Closing at %d: \n", __LINE__);
 
@@ -817,11 +833,7 @@ static void simp_cleanup(simp_context_t* ctx) {
 
     fprintf(stdout, "Closing at %d: \n", __LINE__);
 
-    // TODO: implement proper closing
-    
-    if (atomic_load(&ctx->keep_alive_missed) < MAX_KEEP_ALIVE_MISSES) {
-        pthread_cond_wait(&ctx->keep_alive_closed_cond, &ctx->ka_mutex);
-    }
+    pthread_cond_wait(&ctx->keep_alive_closed_cond, &ctx->ka_mutex);
     pthread_mutex_unlock(&ctx->ka_mutex);
 
 
@@ -902,13 +914,11 @@ static void* keep_alive_handler(void* arg) {
     struct sockaddr_in local_addr;
     bool addr_valid;
 
-    while (atomic_load(&ctx->connection_active)) {
+    while (atomic_load(&ctx->connection_active) && atomic_load(&ctx->remote_peer_active)) {
         printf("KA alive\n");
 
         if(atomic_load(&ctx->keep_alive_missed) == MAX_KEEP_ALIVE_MISSES) {
-            // TODO: fix segfault
-            simp_cleanup(ctx);
-            return NULL;
+            atomic_store(&ctx->remote_peer_active, 0);
         }
 
         pthread_mutex_lock(&ctx->addr_mutex);
@@ -1015,8 +1025,13 @@ static void* nack_handler(void* arg) {
     return NULL;
 }
 
+static int simp_is_connected(simp_context_t *ctx) {
+    return atomic_load(&ctx->remote_peer_active);
+}
+
 static int simp_start(simp_context_t *ctx) {
     atomic_store(&ctx->connection_active, 1);
+    atomic_store(&ctx->remote_peer_active, 1);
     
     int err = pthread_create(&ctx->sender_thread, NULL, sender_handler, ctx);
     if (err) {
@@ -1054,6 +1069,7 @@ static int simp_connect(simp_context_t* ctx, const char* ip, uint16_t port) {
     pthread_mutex_unlock(&ctx->addr_mutex);
 
     atomic_store(&ctx->connection_active, 1);
+    atomic_store(&ctx->remote_peer_active, 1);
     
     int err = pthread_create(&ctx->sender_thread, NULL, sender_handler, ctx);
     if (err) {
