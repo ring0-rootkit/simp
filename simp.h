@@ -30,6 +30,7 @@
 #define KEEP_ALIVE_INTERVAL 1
 #define KEEP_ALIVE_TIMEOUT 5
 #define MAX_NACKS_BEFORE_DROP 3
+#define MAX_KEEP_ALIVE_MISSES 5
 
 // on update update size of pack_info in simp_context_t
 #define MAX_MISSING_IDS 64 
@@ -109,6 +110,7 @@ typedef struct {
     atomic_uint_least8_t rcvd_cntr;
     atomic_uint_least64_t pack_info;
     atomic_uint_least16_t next_avail_packet;
+    atomic_uint_least8_t keep_alive_missed;
     int last_remotely_acked_id; // users last_remotely_acked_mutex
 
     atomic_int should_send_ka_packet;
@@ -271,6 +273,7 @@ static simp_context_t* simp_create_shared_context(const char* name) {
     atomic_init(&ctx->rcvd_cntr, 0);
     atomic_init(&ctx->last_rcvd_id, 0);
     atomic_init(&ctx->next_avail_packet, 1);
+    atomic_init(&ctx->keep_alive_missed, 0);
     atomic_init(&ctx->last_acked_id, 0);
     atomic_init(&ctx->pack_info, 0xFFFFFFFF);
     atomic_init(&ctx->connection_active, 0);
@@ -323,15 +326,18 @@ static void simp_detach_shared_context(simp_context_t* ctx) {
     char shm_name[64];
     strncpy(shm_name, ctx->shm_name, sizeof(shm_name));
     
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
     // Now unmap the shared memory
     if (munmap(ctx, sizeof(simp_context_t)) == -1) {
         ERR("munmap");
     }
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
     
     // Close the file descriptor
     if (close(shm_fd) == -1) {
         ERR("close (shm_fd)");
     }
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
     
     // If this process is the owner, also unlink the shared memory
     if (is_owner) {
@@ -413,6 +419,7 @@ static void* sender_handler(void* arg) {
             header = msg.header;
 
             if (atomic_load(&ctx->should_send_ka_packet)) {
+                atomic_fetch_add(&ctx->keep_alive_missed, 1);
                 atomic_store(&ctx->should_send_ka_packet, 0);
                 header.flags |= FLAG_KEEP_ALIVE_REQ;
             }
@@ -451,8 +458,6 @@ static void* sender_handler(void* arg) {
     return NULL;
 }
 
-//TODO(test): after 3 nack sends set packet as useless
-// TODO(urgent): Why TF it sets 16 bits to 0????
 static void simp_send_nacks(simp_context_t *ctx) {
     message_t keep_alive_msg = {
         .header = {
@@ -614,9 +619,8 @@ static void* simp_reader_handler(void* args) {
         simp_deserialize_header(buffer, &header);
         void* data = buffer + HEADER_SIZE;
 
-        //TODO: if KA reset counter
         if (header.flags & FLAG_KEEP_ALIVE_RESP) {
-            //TODO: reset ka skipped variable
+            atomic_store(&ctx->keep_alive_missed, 0);
         }
 
 
@@ -736,6 +740,7 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     atomic_init(&ctx->rcvd_cntr, 0);
     atomic_init(&ctx->last_rcvd_id, 0);
     atomic_init(&ctx->next_avail_packet, 1);
+    atomic_init(&ctx->keep_alive_missed, 0);
     atomic_init(&ctx->last_acked_id, 0);
     atomic_init(&ctx->pack_info, 0xFFFFFFFF);
     atomic_init(&ctx->connection_active, 0);
@@ -760,6 +765,131 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     return 0;
 }
 
+static int simp_send(simp_context_t* ctx, const uint8_t* data, size_t len,
+                    packet_priority_t prio, uint8_t group_id) {
+
+    message_t msg = {
+        .header = {
+            .group_id = group_id,
+            .data_len = (uint16_t)len,
+            .flags = 0
+        },
+        .priority = prio,
+    };
+    memcpy(msg.data, data, len);
+
+    queue_push(&ctx->send_queue, &msg);
+    return len;
+}
+
+
+static void simp_cleanup(simp_context_t* ctx) {
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+
+    // TODO: send close packet
+    int err = simp_send(ctx, (uint8_t *)"CLOSE", 5, PRIO_HIGH, 0); // placeholder for actual close
+    if (err < 0) {
+        ERR("failed to send CLOSE packet\n");
+    }
+    //TODO: wait for close accept
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+
+    pthread_mutex_lock(&ctx->send_queue.mutex);
+    while(ctx->send_queue.count > 0) {
+        pthread_cond_wait(&ctx->send_queue.not_full, &ctx->send_queue.mutex);
+    }
+    pthread_mutex_unlock(&ctx->send_queue.mutex);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+
+    // lock before setting connection state to 0, so nothing will exit before we can know
+    pthread_mutex_lock(&ctx->ka_mutex);
+    pthread_mutex_lock(&ctx->send_queue.mutex);
+    pthread_mutex_lock(&ctx->sender_closed_mutex);
+    pthread_mutex_lock(&ctx->read_mutex);
+    pthread_mutex_lock(&ctx->nack_queue.mutex);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+
+    atomic_store(&ctx->connection_active, 0);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+
+    // TODO: implement proper closing
+    
+    if (atomic_load(&ctx->keep_alive_missed) < MAX_KEEP_ALIVE_MISSES) {
+        pthread_cond_wait(&ctx->keep_alive_closed_cond, &ctx->ka_mutex);
+    }
+    pthread_mutex_unlock(&ctx->ka_mutex);
+
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+
+    //make sender leave queue_pop with error by sending not_empty notification with count = -1
+    
+    ctx->send_queue.count = -1;
+    pthread_cond_broadcast(&ctx->send_queue.not_empty);
+    pthread_mutex_unlock(&ctx->send_queue.mutex);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+
+    ctx->nack_queue.count = -1;
+    pthread_cond_broadcast(&ctx->nack_queue.not_empty);
+    pthread_mutex_unlock(&ctx->nack_queue.mutex);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+
+    pthread_cond_wait(&ctx->sender_closed_cond, &ctx->sender_closed_mutex);
+    pthread_mutex_unlock(&ctx->sender_closed_mutex);
+    
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    
+    // close sockeet before closing reader so reader can stop reading
+    // and can be notified
+    close(ctx->sockfd);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+
+    pthread_cond_wait(&ctx->reader_closed_cond, &ctx->read_mutex);
+    pthread_mutex_unlock(&ctx->read_mutex);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    
+    queue_cleanup(&ctx->reader_queue);
+    queue_cleanup(&ctx->nack_queue);
+    queue_cleanup(&ctx->user_queue);
+    queue_cleanup(&ctx->send_queue);
+    queue_cleanup(&ctx->pending_queue);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    
+    pthread_mutex_destroy(&ctx->console_write_mutex);
+    pthread_mutex_destroy(&ctx->sock_write_mutex);
+    pthread_mutex_destroy(&ctx->addr_mutex);
+    pthread_mutex_destroy(&ctx->pack_info_mutex);
+    pthread_mutex_destroy(&ctx->seq_mutex);
+    pthread_mutex_destroy(&ctx->read_mutex);
+    pthread_mutex_destroy(&ctx->ka_mutex);
+    pthread_mutex_destroy(&ctx->sender_closed_mutex);
+    pthread_mutex_destroy(&ctx->last_remotely_acked_mutex);
+    pthread_mutex_destroy(&ctx->nacks_sent_mutex);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+
+
+    pthread_cond_destroy(&ctx->keep_alive_closed_cond);
+    pthread_cond_destroy(&ctx->reader_closed_cond);
+    pthread_cond_destroy(&ctx->sender_closed_cond);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    
+    simp_detach_shared_context(ctx);
+
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
+}
+
 static void* keep_alive_handler(void* arg) {
     printf("started KA job\n");
     simp_context_t* ctx = (simp_context_t*)arg;
@@ -774,6 +904,13 @@ static void* keep_alive_handler(void* arg) {
 
     while (atomic_load(&ctx->connection_active)) {
         printf("KA alive\n");
+
+        if(atomic_load(&ctx->keep_alive_missed) == MAX_KEEP_ALIVE_MISSES) {
+            // TODO: fix segfault
+            simp_cleanup(ctx);
+            return NULL;
+        }
+
         pthread_mutex_lock(&ctx->addr_mutex);
         addr_valid = ctx->addr.sin_family != 0;
         if (addr_valid) {
@@ -801,6 +938,8 @@ static void* keep_alive_handler(void* arg) {
             printf("SND KA:\n");
             simp_display_packet(ctx, &keep_alive, (uint8_t*)"");
             printf("---------------------------------\n");
+
+            atomic_fetch_add(&ctx->keep_alive_missed, 1);
 
             pthread_mutex_lock(&ctx->sock_write_mutex);
             int err = sendto(ctx->sockfd, buffer, HEADER_SIZE, 0,
@@ -943,130 +1082,8 @@ static int simp_connect(simp_context_t* ctx, const char* ip, uint16_t port) {
     return 0;
 }
 
-static int simp_send(simp_context_t* ctx, const uint8_t* data, size_t len,
-                    packet_priority_t prio, uint8_t group_id) {
-
-    message_t msg = {
-        .header = {
-            .group_id = group_id,
-            .data_len = (uint16_t)len,
-            .flags = 0
-        },
-        .priority = prio,
-    };
-    memcpy(msg.data, data, len);
-
-    queue_push(&ctx->send_queue, &msg);
-    return len;
-}
-
 static simp_context_t* simp_new() {
     return simp_create_shared_context(NULL);
 }
-
-static void simp_cleanup(simp_context_t* ctx) {
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-    // TODO: send close packet
-    int err = simp_send(ctx, (uint8_t *)"CLOSE", 5, PRIO_HIGH, 0); // placeholder for actual close
-    if (err < 0) {
-        ERR("failed to send CLOSE packet\n");
-    }
-    //TODO: wait for close accept
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-    pthread_mutex_lock(&ctx->send_queue.mutex);
-    while(ctx->send_queue.count > 0) {
-        pthread_cond_wait(&ctx->send_queue.not_full, &ctx->send_queue.mutex);
-    }
-    pthread_mutex_unlock(&ctx->send_queue.mutex);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-    // lock before setting connection state to 0, so nothing will exit before we can know
-    pthread_mutex_lock(&ctx->ka_mutex);
-    pthread_mutex_lock(&ctx->send_queue.mutex);
-    pthread_mutex_lock(&ctx->sender_closed_mutex);
-    pthread_mutex_lock(&ctx->read_mutex);
-    pthread_mutex_lock(&ctx->nack_queue.mutex);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-    atomic_store(&ctx->connection_active, 0);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-    // TODO: implement proper closing
-
-    pthread_cond_wait(&ctx->keep_alive_closed_cond, &ctx->ka_mutex);
-    pthread_mutex_unlock(&ctx->ka_mutex);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-    //make sender leave queue_pop with error by sending not_empty notification with count = -1
-    
-    ctx->send_queue.count = -1;
-    pthread_cond_broadcast(&ctx->send_queue.not_empty);
-    pthread_mutex_unlock(&ctx->send_queue.mutex);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-    ctx->nack_queue.count = -1;
-    pthread_cond_broadcast(&ctx->nack_queue.not_empty);
-    pthread_mutex_unlock(&ctx->nack_queue.mutex);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-    pthread_cond_wait(&ctx->sender_closed_cond, &ctx->sender_closed_mutex);
-    pthread_mutex_unlock(&ctx->sender_closed_mutex);
-    
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-    
-    // close sockeet before closing reader so reader can stop reading
-    // and can be notified
-    close(ctx->sockfd);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-    pthread_cond_wait(&ctx->reader_closed_cond, &ctx->read_mutex);
-    pthread_mutex_unlock(&ctx->read_mutex);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-    
-    queue_cleanup(&ctx->reader_queue);
-    queue_cleanup(&ctx->nack_queue);
-    queue_cleanup(&ctx->user_queue);
-    queue_cleanup(&ctx->send_queue);
-    queue_cleanup(&ctx->pending_queue);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-    
-    pthread_mutex_destroy(&ctx->console_write_mutex);
-    pthread_mutex_destroy(&ctx->sock_write_mutex);
-    pthread_mutex_destroy(&ctx->addr_mutex);
-    pthread_mutex_destroy(&ctx->pack_info_mutex);
-    pthread_mutex_destroy(&ctx->seq_mutex);
-    pthread_mutex_destroy(&ctx->read_mutex);
-    pthread_mutex_destroy(&ctx->ka_mutex);
-    pthread_mutex_destroy(&ctx->sender_closed_mutex);
-    pthread_mutex_destroy(&ctx->last_remotely_acked_mutex);
-    pthread_mutex_destroy(&ctx->nacks_sent_mutex);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-
-
-    pthread_cond_destroy(&ctx->keep_alive_closed_cond);
-    pthread_cond_destroy(&ctx->reader_closed_cond);
-    pthread_cond_destroy(&ctx->sender_closed_cond);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-    
-    simp_detach_shared_context(ctx);
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-}
-
 
 #endif // SIMP_H
