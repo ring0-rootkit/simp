@@ -418,7 +418,6 @@ exit_error:
     return -1;
 }
 
-// TODO: implement
 static void clear_group_from_queue(message_queue_t *queue, uint16_t group_id) {
     message_t msg;
     for (int i = 0; i < MAX_QUEUE_SIZE; i++) {
