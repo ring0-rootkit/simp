@@ -121,7 +121,6 @@ typedef struct {
     atomic_uint_least8_t missed_ka_num; // number of missed keep alive packets
     char nacks_sent[64];
     
-    message_queue_t reader_queue;
     message_queue_t nack_queue;
     message_queue_t user_queue;
     message_queue_t send_queue;
@@ -311,7 +310,6 @@ static simp_context_t* simp_create_shared_context(const char* name) {
     
     pthread_condattr_destroy(&cond_attr);
     
-    queue_init(&ctx->reader_queue);
     queue_init(&ctx->nack_queue);
     queue_init(&ctx->user_queue);
     queue_init(&ctx->send_queue);
@@ -395,8 +393,45 @@ exit_error:
     return -1;
 }
 
+static int queue_try_pop(message_queue_t* queue, message_t* msg) {
+    pthread_mutex_lock(&queue->mutex);
+
+    if (queue->count == -1) { // count set to -1 only in closing state
+        goto exit_error;
+    }
+
+    if (queue->count == 0) {
+        goto exit_error;
+    }
+    
+    memcpy(msg, &queue->messages[queue->head], sizeof(message_t));
+    queue->head = (queue->head + 1) % MAX_QUEUE_SIZE;
+    queue->count--;
+
+    pthread_cond_signal(&queue->not_full);
+    pthread_mutex_unlock(&queue->mutex);
+    return 0;
+
+exit_error:
+    pthread_cond_signal(&queue->not_full);
+    pthread_mutex_unlock(&queue->mutex);
+    return -1;
+}
+
 // TODO: implement
 static void clear_group_from_queue(message_queue_t *queue, uint16_t group_id) {
+    message_t msg;
+    for (int i = 0; i < MAX_QUEUE_SIZE; i++) {
+        int err = queue_try_pop(queue, &msg);
+        if (err < 0) {
+            return;
+        } 
+
+       if (msg.header.group_id == group_id) {
+           continue;
+       }
+       queue_push(queue, &msg);
+    }
 }
 
 static void* sender_handler(void* arg) {
@@ -413,6 +448,9 @@ static void* sender_handler(void* arg) {
             msg.header.ack_id = atomic_load(&ctx->last_acked_id);
 
             if (msg.priority == PRIO_HIGH) {
+                queue_push(&ctx->pending_queue, &msg);
+            } else if (msg.priority == PRIO_MEDIUM) {
+                clear_group_from_queue(&ctx->pending_queue, msg.header.group_id);
                 queue_push(&ctx->pending_queue, &msg);
             }
 
@@ -765,7 +803,6 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     pthread_mutex_init(&ctx->last_remotely_acked_mutex, NULL);
     pthread_mutex_init(&ctx->nacks_sent_mutex, NULL);
     
-    queue_init(&ctx->reader_queue);
     queue_init(&ctx->nack_queue);
     queue_init(&ctx->user_queue);
     queue_init(&ctx->send_queue);
@@ -801,14 +838,6 @@ static void simp_cleanup(simp_context_t* ctx) {
     if (ctx == NULL) {
         return;
     }
-
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
-    //
-    // int err = simp_send(ctx, (uint8_t *)"CLOSE", 5, PRIO_HIGH, -1); // placeholder for actual close
-    // if (err < 0) {
-    //     ERR("failed to send CLOSE packet\n");
-    // }
-    // //TODO: wait for close accept
 
     fprintf(stdout, "Closing at %d: \n", __LINE__);
 
@@ -869,10 +898,12 @@ static void simp_cleanup(simp_context_t* ctx) {
 
     fprintf(stdout, "Closing at %d: \n", __LINE__);
     
-    queue_cleanup(&ctx->reader_queue);
     queue_cleanup(&ctx->nack_queue);
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
     queue_cleanup(&ctx->user_queue);
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
     queue_cleanup(&ctx->send_queue);
+    fprintf(stdout, "Closing at %d: \n", __LINE__);
     queue_cleanup(&ctx->pending_queue);
 
     fprintf(stdout, "Closing at %d: \n", __LINE__);
