@@ -807,6 +807,8 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     queue_init(&ctx->send_queue);
     queue_init(&ctx->pending_queue);
 
+    memset(&ctx->addr, 0, sizeof(addr));
+
     return 0;
 }
 
@@ -945,8 +947,6 @@ static void* keep_alive_handler(void* arg) {
     bool addr_valid;
 
     while (atomic_load(&ctx->connection_active) && atomic_load(&ctx->remote_peer_active)) {
-        printf("KA alive\n");
-
         if(atomic_load(&ctx->keep_alive_missed) == MAX_KEEP_ALIVE_MISSES) {
             atomic_store(&ctx->remote_peer_active, 0);
         }
@@ -955,6 +955,9 @@ static void* keep_alive_handler(void* arg) {
         addr_valid = ctx->addr.sin_family != 0;
         if (addr_valid) {
             local_addr = ctx->addr;
+        } else {
+            pthread_mutex_unlock(&ctx->addr_mutex);
+            continue;
         }
         pthread_mutex_unlock(&ctx->addr_mutex);
 

@@ -19,7 +19,7 @@ int main(void) {
   }
   printf("init\n");
 
-  err = simp_connect(ctx, "127.0.0.1", 5000);
+  err = simp_connect(ctx, "127.0.0.1", 6000);
   if (err) {
     perror("cannot connect");
     simp_cleanup(ctx);
@@ -28,18 +28,6 @@ int main(void) {
 
   printf("before send\n");
   err = simp_send(ctx, (const uint8_t *)"Test1", 5, PRIO_HIGH, 1);
-  if (err < 0) {
-    perror("send");
-    simp_cleanup(ctx);
-    return 1;
-  }
-  err = simp_send(ctx, (const uint8_t *)"Test2", 5, PRIO_MEDIUM, 1);
-  if (err < 0) {
-    perror("send");
-    simp_cleanup(ctx);
-    return 1;
-  }
-  err = simp_send(ctx, (const uint8_t *)"Test3", 5, PRIO_MEDIUM, 1);
   if (err < 0) {
     perror("send");
     simp_cleanup(ctx);
