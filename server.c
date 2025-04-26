@@ -10,7 +10,7 @@ int main(void) {
     return 1;
   }
 
-  int err = simp_init(ctx, "127.0.0.1", 5000);
+  int err = simp_init(ctx, "127.0.0.1", 6000);
   if (err) {
     perror("cannot init");
     simp_cleanup(ctx);
