@@ -18,10 +18,20 @@
 #include <fcntl.h>
 #include <errno.h>
 
+#define NO_DEBUG_PRINT
+
 #define ERR(desc) do { \
     fprintf(stderr, "Error at %s:%d: ", __FILE__, __LINE__); \
     perror(desc); \
 } while (0)
+
+#ifndef NO_DEBUG_PRINT
+#define S_PRINTF(...) do { \
+    printf(__VA_ARGS__); \
+} while(0)
+#else
+#define S_PRINTF(...) do{}while(0)
+#endif
 
 #define SIMP_VERSION 1
 #define MAX_PACKET_SIZE 1500
@@ -29,7 +39,7 @@
 #define RCVD_BUFFER_SIZE 128
 #define KEEP_ALIVE_INTERVAL 1
 #define KEEP_ALIVE_TIMEOUT 5
-#define MAX_NACKS_BEFORE_DROP 3
+#define MAX_NACKS_BEFORE_DROP 10
 #define MAX_KEEP_ALIVE_MISSES 5
 
 #define ERR_CLOSED 7
@@ -101,6 +111,7 @@ typedef struct {
     pthread_mutex_t sender_closed_mutex;  // for sender_closed_cond
     pthread_mutex_t last_remotely_acked_mutex;
     pthread_mutex_t nacks_sent_mutex;
+    pthread_mutex_t ka_ids_mutex;         // for keep alive IDs array
 
     pthread_cond_t keep_alive_closed_cond;
     pthread_cond_t reader_closed_cond;
@@ -120,6 +131,10 @@ typedef struct {
     atomic_int should_send_ka_resp;
     atomic_uint_least8_t missed_ka_num; // number of missed keep alive packets
     char nacks_sent[64];
+    
+    // Keep alive IDs tracking
+    uint16_t ignore_list[32];  // Circular buffer for ignored packet IDs
+    size_t ignore_list_index;  // Current position in the circular buffer
     
     message_queue_t nack_queue;
     message_queue_t user_queue;
@@ -175,34 +190,34 @@ static void queue_init(message_queue_t* queue) {
 }
 
 static inline void simp_display_prep_line() {
-    printf("                                       │\r");
-    printf("│ ");
+    S_PRINTF("                                       │\r");
+    S_PRINTF("│ ");
 }
 
 #define RIGHT_PAD_FORMATTED(msg, format) do {   \
         simp_display_prep_line();               \
-        printf(msg, format);                    \
-        printf("\n");                           \
+        S_PRINTF(msg, format);                    \
+        S_PRINTF("\n");                           \
     } while(0)
 static inline void simp_display_packet(simp_context_t *ctx, packet_header_t* header, uint8_t* data) {
     pthread_mutex_lock(&ctx->console_write_mutex);
-    printf("\n┌──────────────────────────────────────┐\n");
-    printf("│ Context Information                  │\n");
+    S_PRINTF("\n┌──────────────────────────────────────┐\n");
+    S_PRINTF("│ Context Information                  │\n");
     RIGHT_PAD_FORMATTED("Last rcvd: %d", header->version);
-    printf("│ Last 32 packet bitmap:               │\n");
-    printf("│ ");
+    S_PRINTF("│ Last 32 packet bitmap:               │\n");
+    S_PRINTF("│ ");
     for (int i = sizeof(ctx->pack_info) * 8 / 2 - 1; i >= 0; i--) {
-        printf("%lu", (ctx->pack_info >> i) & 1);
+        S_PRINTF("%lu", (ctx->pack_info >> i) & 1);
     }
-    printf("     │\n");
-    printf("├──────────────────────────────────────┤\n");
-    printf("│ Packet Information                   │\n");
-    printf("├──────────────────────────────────────┤\n");
+    S_PRINTF("     │\n");
+    S_PRINTF("├──────────────────────────────────────┤\n");
+    S_PRINTF("│ Packet Information                   │\n");
+    S_PRINTF("├──────────────────────────────────────┤\n");
     RIGHT_PAD_FORMATTED("Version: %d", header->version);
     RIGHT_PAD_FORMATTED("Group ID: %d", header->group_id);
     RIGHT_PAD_FORMATTED("Sequence ID: %d", header->seq_id);
     RIGHT_PAD_FORMATTED("Acknowledgment ID: %d", header->ack_id);
-    printf("│ Flags:                               │\n");
+    S_PRINTF("│ Flags:                               │\n");
     RIGHT_PAD_FORMATTED("  Keep Alive Request: %s", 
            (header->flags & FLAG_KEEP_ALIVE_REQ) ? "Yes" : "No ");
     RIGHT_PAD_FORMATTED("  Keep Alive Response: %s", 
@@ -210,25 +225,25 @@ static inline void simp_display_packet(simp_context_t *ctx, packet_header_t* hea
     RIGHT_PAD_FORMATTED("  NACK: %s", 
            (header->flags & FLAG_NACK) ? "Yes" : "No ");
     RIGHT_PAD_FORMATTED("Data Length: %d bytes", header->data_len);
-    printf("├──────────────────────────────────────┤\n");
+    S_PRINTF("├──────────────────────────────────────┤\n");
     
     if (header->data_len > 0) {
-        printf("│ Data:                                │\n");
+        S_PRINTF("│ Data:                                │\n");
         simp_display_prep_line();
         for (int i = 0; i < header->data_len; i++) {
-            printf("%02X ", data[i]);
+            S_PRINTF("%02X ", data[i]);
             if ((i + 1) % 8 == 0) {
-                printf("\n");
+                S_PRINTF("\n");
                 simp_display_prep_line();
             }
         }
         if (header->data_len % 8 != 0) {
-            printf("\n");
+            S_PRINTF("\n");
         }
-        printf("\r└──────────────────────────────────────┘\n");
+        S_PRINTF("\r└──────────────────────────────────────┘\n");
     } else {
-        printf("│ No data payload                      │\n");
-        printf("└──────────────────────────────────────┘\n");
+        S_PRINTF("│ No data payload                      │\n");
+        S_PRINTF("└──────────────────────────────────────┘\n");
     }
     pthread_mutex_unlock(&ctx->console_write_mutex);
 }
@@ -297,6 +312,7 @@ static simp_context_t* simp_create_shared_context(const char* name) {
     pthread_mutex_init(&ctx->sender_closed_mutex, &mutex_attr);
     pthread_mutex_init(&ctx->last_remotely_acked_mutex, &mutex_attr);
     pthread_mutex_init(&ctx->nacks_sent_mutex, &mutex_attr);
+    pthread_mutex_init(&ctx->ka_ids_mutex, &mutex_attr);
     
     pthread_mutexattr_destroy(&mutex_attr);
     
@@ -315,6 +331,10 @@ static simp_context_t* simp_create_shared_context(const char* name) {
     queue_init(&ctx->send_queue);
     queue_init(&ctx->pending_queue);
     
+    // Initialize keep alive tracking
+    memset(ctx->ignore_list, 0, sizeof(ctx->ignore_list));
+    ctx->ignore_list_index = 0;
+    
     return ctx;
 }
 
@@ -328,18 +348,18 @@ static void simp_detach_shared_context(simp_context_t* ctx) {
     char shm_name[64];
     strncpy(shm_name, ctx->shm_name, sizeof(shm_name));
     
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
     // Now unmap the shared memory
     if (munmap(ctx, sizeof(simp_context_t)) == -1) {
         ERR("munmap");
     }
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
     
     // Close the file descriptor
     if (close(shm_fd) == -1) {
         ERR("close (shm_fd)");
     }
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
     
     // If this process is the owner, also unlink the shared memory
     if (is_owner) {
@@ -453,10 +473,6 @@ static void* sender_handler(void* arg) {
                 queue_push(&ctx->pending_queue, &msg);
             }
 
-            if (msg.header.seq_id == 2) {
-                continue;
-            }
-
             header = msg.header;
 
             if (atomic_load(&ctx->should_send_ka_packet)) {
@@ -476,10 +492,10 @@ static void* sender_handler(void* arg) {
             local_addr = ctx->addr;
             pthread_mutex_unlock(&ctx->addr_mutex);
 
-            printf("---------------------------------\n");
-            printf("SND:\n");
-            simp_display_packet(ctx, &header, msg.data);
-            printf("---------------------------------\n");
+            // S_PRINTF("---------------------------------\n");
+            // S_PRINTF("SND:\n");
+            // simp_display_packet(ctx, &header, msg.data);
+            // S_PRINTF("---------------------------------\n");
 
             pthread_mutex_lock(&ctx->sock_write_mutex);
             int err = sendto(ctx->sockfd, buffer, HEADER_SIZE + msg.header.data_len, 0,
@@ -508,26 +524,36 @@ static void simp_send_nacks(simp_context_t *ctx) {
         .priority = PRIO_HIGH,
     };
     
-    uint16_t buf[MAX_MISSING_IDS*sizeof(ctx->next_seq_id)];
+    uint16_t buf[MAX_MISSING_IDS];  // Fixed buffer size to match MAX_MISSING_IDS
     int buf_idx = 0;
     pthread_mutex_lock(&ctx->pack_info_mutex);
     uint32_t pack_info = atomic_load(&ctx->pack_info);
     uint16_t cur_id = atomic_load(&ctx->last_rcvd_id);
     uint16_t last_acked = atomic_load(&ctx->last_acked_id);
     int i;
-    printf("last acked: %d cur_id: %d\n", last_acked, cur_id);
+    S_PRINTF("last acked: %d cur_id: %d\n", last_acked, cur_id);
 
     pthread_mutex_lock(&ctx->nacks_sent_mutex);
     for(i = 0; i < MAX_MISSING_IDS && cur_id > last_acked; i++) {
-        printf("checking %d packet\n", i);
         if(!(pack_info & (1<<i))) {
-            printf("found nack\n");
-
-            int next = atomic_load(&ctx->next_avail_packet);
-            if (ctx->nacks_sent[next & 0x7F] >= MAX_NACKS_BEFORE_DROP) {
-                ctx->nacks_sent[next & 0x7F] = 0;
-                atomic_store(&ctx->next_avail_packet, next+1);
-                pack_info = pack_info | (1<<i);
+            if (ctx->nacks_sent[cur_id & 0x7F] >= MAX_NACKS_BEFORE_DROP) {
+                // Drop the missing packet after 3 NACKs
+                S_PRINTF("Dropping packet with seq_id: %d after 3 NACKs\n", cur_id);
+                ctx->nacks_sent[cur_id & 0x7F] = 0;
+                
+                // Add to ignore list instead of incrementing next_avail_packet
+                pthread_mutex_lock(&ctx->ka_ids_mutex);
+                ctx->ignore_list[ctx->ignore_list_index] = cur_id;
+                ctx->ignore_list_index = (ctx->ignore_list_index + 1);
+                if (ctx->ignore_list_index >= 32) {
+                    ctx->ignore_list_index = 0;
+                }
+                S_PRINTF("Added dropped packet %d to ignore list\n", cur_id);
+                pthread_mutex_unlock(&ctx->ka_ids_mutex);
+                
+                // Mark as received in pack_info to avoid further NACKs
+                pack_info |= (1<<i);
+                continue; // Skip sending NACK for this packet
             }
 
             ctx->nacks_sent[cur_id&0x7F]++;
@@ -545,6 +571,8 @@ static void simp_send_nacks(simp_context_t *ctx) {
     if (buf_idx == 0) {
         return;
     }
+
+    S_PRINTF("sending nack packet: %s\n", buf);
 
     keep_alive_msg.header.data_len = buf_idx*2; // 2 byte per packet_id
     memcpy(keep_alive_msg.data, buf, keep_alive_msg.header.data_len);
@@ -595,17 +623,25 @@ static int simp_update_pack_info(simp_context_t *ctx, packet_header_t *header) {
     int should_drop = 1;
 
     pthread_mutex_lock(&ctx->pack_info_mutex);
-    int packet_diff = header->seq_id - ctx->last_rcvd_id;
+    int packet_diff = header->seq_id - atomic_load(&ctx->last_rcvd_id);
     int pack_info = atomic_load(&ctx->pack_info);
 
     if (packet_diff < 0) {
+        // This is a duplicate packet
         pack_info |= (1 << -packet_diff);
         should_drop = 0;
         goto done;
     } 
 
-    // ensure that pack_info has 
-    // 'packet_diff' number of 1 in the leftmost position
+    if (packet_diff == 0) {
+        // This is the expected next packet
+        pack_info = (pack_info << 1) | 1;
+        atomic_store(&ctx->last_rcvd_id, header->seq_id);
+        should_drop = 0;
+        goto done;
+    }
+
+    // For new packets, ensure we have enough 1s in the bitmap
     int pack_diff_bitmap = (0xFFFFFFFF << (MAX_MISSING_IDS - packet_diff));
     if ((pack_info & pack_diff_bitmap) == pack_diff_bitmap) {
         pack_info = pack_info << packet_diff;
@@ -616,10 +652,8 @@ static int simp_update_pack_info(simp_context_t *ctx, packet_header_t *header) {
     }
 
 done:
-
     atomic_store(&ctx->pack_info, pack_info);
     pthread_mutex_unlock(&ctx->pack_info_mutex);
-
     return should_drop;
 }
 
@@ -668,7 +702,7 @@ static void* simp_reader_handler(void* args) {
         err = simp_update_pack_info(ctx, &header);
         if (err) {
             //drop the packet
-            printf("dropped packet with seq_id: %d\n", header.seq_id);
+            S_PRINTF("dropped packet with seq_id: %d\n", header.seq_id);
             continue;
         }
 
@@ -687,21 +721,31 @@ static void* simp_reader_handler(void* args) {
         pthread_mutex_unlock(&ctx->last_remotely_acked_mutex);
         simp_remove_pending_acked_packets(ctx);
 
-        printf("---------------------------------\n");
-        printf("RCV:\n");
-        simp_display_packet(ctx, &header, data);
-        printf("---------------------------------\n");
+        // S_PRINTF("---------------------------------\n");
+        // S_PRINTF("RCV:\n");
+        // simp_display_packet(ctx, &header, data);
+        // S_PRINTF("---------------------------------\n");
 
         if(header.flags & FLAG_KEEP_ALIVE_REQ) {
             atomic_store(&ctx->should_send_ka_resp, 1);
         }
 
         if (header.flags & FLAG_NACK) {
-            printf("FOUND NACK PACKET\n");
+            S_PRINTF("FOUND NACK PACKET\n");
+            S_PRINTF("nacks: %.1024s\n", msg.data);
 
             if (header.seq_id < last_rcvd_id) {
                 continue;
             }
+
+            pthread_mutex_lock(&ctx->ka_ids_mutex);
+            ctx->ignore_list[ctx->ignore_list_index] = header.seq_id;
+            ctx->ignore_list_index = (ctx->ignore_list_index + 1);
+            if (ctx->ignore_list_index >= 32) {
+                ctx->ignore_list_index = 0;
+            }
+            S_PRINTF("Added NACK packet %d to ignore list\n", header.seq_id);
+            pthread_mutex_unlock(&ctx->ka_ids_mutex);
 
             uint16_t* missing_ids = (uint16_t*)data;
             size_t missing_count = (header.data_len - HEADER_SIZE) / sizeof(uint16_t);
@@ -715,14 +759,25 @@ static void* simp_reader_handler(void* args) {
         }
 
         if (header.data_len == 0) {
+            // Store keep alive packet ID if data is empty and it is not nack
+            pthread_mutex_lock(&ctx->ka_ids_mutex);
+            ctx->ignore_list[ctx->ignore_list_index] = header.seq_id;
+            ctx->ignore_list_index = (ctx->ignore_list_index + 1);
+            if (ctx->ignore_list_index >= 32) {
+                ctx->ignore_list_index = 0;
+            }
+            S_PRINTF("Added keep alive packet %d to ignore list\n", header.seq_id);
+            pthread_mutex_unlock(&ctx->ka_ids_mutex);
             continue;
         }
 
-        printf("new packet with data: %.*s\n", header.data_len, (char*)data);
+        S_PRINTF("new packet with data: %.*s\n", header.data_len, (char*)data);
 
         msg.header = header;
 
         memcpy(msg.data, data, header.data_len);
+
+        S_PRINTF("writing to user queue...\n");
         queue_push(&ctx->user_queue, &msg);
     }
 
@@ -739,11 +794,34 @@ static int simp_recv(simp_context_t* ctx, char* buf, int buf_len) {
     }
     message_t msg;
     
+    S_PRINTF("trying to read from user queue...\n");
     while (queue_pop(&ctx->user_queue, &msg) == 0) {
-        if (msg.header.seq_id == atomic_load(&ctx->next_avail_packet)) {
-            atomic_fetch_add(&ctx->next_avail_packet, 1);
+        uint16_t next_avail = atomic_load(&ctx->next_avail_packet);
+        
+        // Check if this packet should be ignored
+        bool should_ignore = false;
+        pthread_mutex_lock(&ctx->ka_ids_mutex);
+        for (size_t i = 0; i < 32; i++) {
+            if (ctx->ignore_list[i] == next_avail) {
+                should_ignore = true;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&ctx->ka_ids_mutex);
+        
+        if (should_ignore) {
+            S_PRINTF("Ignoring packet with seq_id: %d\n", next_avail);
+            atomic_store(&ctx->next_avail_packet, next_avail + 1);
+            queue_push(&ctx->user_queue, &msg);
+            continue;
+        }
+        
+        if (msg.header.seq_id == next_avail) {
+            S_PRINTF("RETURNING DATA TO USER...\n");
+            atomic_store(&ctx->next_avail_packet, next_avail + 1);
             break;
         } else {
+            S_PRINTF("next avail: %hu cur id: %hu\n", next_avail, msg.header.seq_id);
             queue_push(&ctx->user_queue, &msg);
         }
     }
@@ -765,7 +843,7 @@ static int simp_init(simp_context_t* ctx, const char* ip, uint16_t port) {
     tv.tv_usec = 0;
     setsockopt(ctx->sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
-    printf("created new socket, fd: %d\n", ctx->sockfd);
+    S_PRINTF("created new socket, fd: %d\n", ctx->sockfd);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -840,7 +918,7 @@ static void simp_cleanup(simp_context_t* ctx) {
         return;
     }
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
 
     pthread_mutex_lock(&ctx->send_queue.mutex);
     while(ctx->send_queue.count > 0) {
@@ -848,7 +926,7 @@ static void simp_cleanup(simp_context_t* ctx) {
     }
     pthread_mutex_unlock(&ctx->send_queue.mutex);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
 
     // lock before setting connection state to 0, so nothing will exit before we can know
     pthread_mutex_lock(&ctx->ka_mutex);
@@ -857,17 +935,17 @@ static void simp_cleanup(simp_context_t* ctx) {
     pthread_mutex_lock(&ctx->read_mutex);
     pthread_mutex_lock(&ctx->nack_queue.mutex);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
 
     atomic_store(&ctx->connection_active, 0);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
 
     pthread_cond_wait(&ctx->keep_alive_closed_cond, &ctx->ka_mutex);
     pthread_mutex_unlock(&ctx->ka_mutex);
 
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
 
     //make sender leave queue_pop with error by sending not_empty notification with count = -1
     
@@ -875,39 +953,39 @@ static void simp_cleanup(simp_context_t* ctx) {
     pthread_cond_broadcast(&ctx->send_queue.not_empty);
     pthread_mutex_unlock(&ctx->send_queue.mutex);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
 
     ctx->nack_queue.count = -1;
     pthread_cond_broadcast(&ctx->nack_queue.not_empty);
     pthread_mutex_unlock(&ctx->nack_queue.mutex);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
 
     pthread_cond_wait(&ctx->sender_closed_cond, &ctx->sender_closed_mutex);
     pthread_mutex_unlock(&ctx->sender_closed_mutex);
     
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
     
     // close sockeet before closing reader so reader can stop reading
     // and can be notified
     close(ctx->sockfd);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
 
     pthread_cond_wait(&ctx->reader_closed_cond, &ctx->read_mutex);
     pthread_mutex_unlock(&ctx->read_mutex);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
     
     queue_cleanup(&ctx->nack_queue);
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
     queue_cleanup(&ctx->user_queue);
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
     queue_cleanup(&ctx->send_queue);
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
     queue_cleanup(&ctx->pending_queue);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
     
     pthread_mutex_destroy(&ctx->console_write_mutex);
     pthread_mutex_destroy(&ctx->sock_write_mutex);
@@ -919,23 +997,24 @@ static void simp_cleanup(simp_context_t* ctx) {
     pthread_mutex_destroy(&ctx->sender_closed_mutex);
     pthread_mutex_destroy(&ctx->last_remotely_acked_mutex);
     pthread_mutex_destroy(&ctx->nacks_sent_mutex);
+    pthread_mutex_destroy(&ctx->ka_ids_mutex);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
 
 
     pthread_cond_destroy(&ctx->keep_alive_closed_cond);
     pthread_cond_destroy(&ctx->reader_closed_cond);
     pthread_cond_destroy(&ctx->sender_closed_cond);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
     
     simp_detach_shared_context(ctx);
 
-    fprintf(stdout, "Closing at %d: \n", __LINE__);
+    // fprintf(stdout, "Closing at %d: \n", __LINE__);
 }
 
 static void* keep_alive_handler(void* arg) {
-    printf("started KA job\n");
+    S_PRINTF("started KA job\n");
     simp_context_t* ctx = (simp_context_t*)arg;
     uint8_t buffer[HEADER_SIZE];
     packet_header_t keep_alive = {
@@ -965,7 +1044,7 @@ static void* keep_alive_handler(void* arg) {
         atomic_store(&ctx->should_send_ka_packet, (ctx->send_queue.count != 0));
         pthread_mutex_unlock(&ctx->send_queue.mutex);
 
-        printf("before if with addr_valid:%b, and should_send_ka: %b\n", addr_valid, atomic_load(&ctx->should_send_ka_packet));
+        // S_PRINTF("before if with addr_valid:%b, and should_send_ka: %b\n", addr_valid, atomic_load(&ctx->should_send_ka_packet));
         if (addr_valid && !atomic_load(&ctx->should_send_ka_packet)) {
             if (atomic_load(&ctx->should_send_ka_resp)) {
                 atomic_store(&ctx->should_send_ka_resp, 0);
@@ -977,10 +1056,10 @@ static void* keep_alive_handler(void* arg) {
 
             simp_serialize_header(&keep_alive, buffer);
 
-            printf("---------------------------------\n");
-            printf("SND KA:\n");
-            simp_display_packet(ctx, &keep_alive, (uint8_t*)"");
-            printf("---------------------------------\n");
+            // S_PRINTF("---------------------------------\n");
+            // S_PRINTF("SND KA:\n");
+            // simp_display_packet(ctx, &keep_alive, (uint8_t*)"");
+            // S_PRINTF("---------------------------------\n");
 
             atomic_fetch_add(&ctx->keep_alive_missed, 1);
 
@@ -1013,7 +1092,7 @@ static void* nack_handler(void* arg) {
 
     while (atomic_load(&ctx->connection_active)) {
         if (queue_pop(&ctx->nack_queue, &msg) == 0) {
-            printf("found new NACK, restoring...\n");
+            S_PRINTF("found new NACK, restoring...\n");
 
             uint16_t* missing_ids = (uint16_t*)msg.data;
             size_t missing_count = msg.header.data_len / sizeof(uint16_t);
@@ -1054,7 +1133,7 @@ static void* nack_handler(void* arg) {
         }
         usleep(10000);
     }
-    printf("nack queue closed\n");
+    S_PRINTF("nack queue closed\n");
     return NULL;
 }
 

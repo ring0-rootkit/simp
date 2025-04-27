@@ -1,0 +1,20 @@
+0, 1, 2, 3, 4, 5 % packet loss
+
+TCP:
+TCP + keep alive:
+SIMP(TCP mode):
+
+UDP:
+SIMP(UDP mode):
+
+TCP:
+TCP +keep alive:
+SIMP (MEDIUM PRIO):
+
+big packet loss breaks even tcp so max is 5%
+
+we can change NACKS_BEFORE_DROP, it increases network load but allowes it to work in higher 
+drop rate networks
+
+no useless feature when packets are glued together
+check for tcp packet glueing

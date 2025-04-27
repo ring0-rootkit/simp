@@ -1,7 +1,10 @@
-#include "simp.h"
 #include <signal.h>
 #include <fcntl.h>
 #include <pthread.h>
+
+#include "simp.h"
+
+char* buffer[1024] = {0};
 
 int main(void) {
   simp_context_t *ctx = simp_new();
@@ -27,11 +30,15 @@ int main(void) {
   }
 
   printf("before send\n");
-  err = simp_send(ctx, (const uint8_t *)"Test1", 5, PRIO_HIGH, 1);
-  if (err < 0) {
-    perror("send");
-    simp_cleanup(ctx);
-    return 1;
+  for (int i = 0; i < 1000; i++) {
+    snprintf(buffer, sizeof(buffer), "%d", i);
+    err = simp_send(ctx, (const uint8_t *)buffer, 5, PRIO_HIGH, 1);
+    if (err < 0) {
+      perror("send");
+      simp_cleanup(ctx);
+      return 1;
+    }
+    usleep(100000);
   }
   while(simp_is_connected(ctx)){usleep(1000);}
   simp_cleanup(ctx);

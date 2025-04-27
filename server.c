@@ -26,13 +26,21 @@ int main(void) {
   }
 
   char buf[128];
-  int len = simp_recv(ctx, buf, 128);
-  if (len < 0) {
-    perror("read");
-    simp_cleanup(ctx);
-    return 1;
+  for (int i = 0; i < 1000; i++) {
+    int len = simp_recv(ctx, buf, 128);
+    if (len < 0) {
+      perror("read");
+      simp_cleanup(ctx);
+      return 1;
+    }
+    if (i != atoi(buf)) {
+      printf("messages are out of order!\n");
+      printf("recieved: %d, expected: %d\n", atoi(buf), i);
+      simp_cleanup(ctx);
+      return 1;
+    }
+    printf("%.*s\n", len, buf);
   }
-  printf("packet 1: %.*s\n", len, buf);
 
   simp_cleanup(ctx);
   

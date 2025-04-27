@@ -12,7 +12,8 @@ class Proxy:
     def __init__(self, args):
         self.args = args
         self.sent_packets = 0
-        self.dropped_packets = 0
+        self.dropped_packets_client1_to_client2 = 0
+        self.dropped_packets_client2_to_client1 = 0
         self.lock = threading.Lock()
 
     def start(self):
@@ -39,19 +40,23 @@ class Proxy:
                     data, addr = sock.recvfrom(65535)
                     with self.lock:
                         if random.random() < self.args.drop_rate:
-                            self.dropped_packets += 1
-                            print(f"Dropped packet from {
-                                  'Client1' if sock == sock1 else 'Client2'}")
+                            if sock == sock1:
+                                self.dropped_packets_client1_to_client2 += 1
+                                direction = "Client1->Client2"
+                            else:
+                                self.dropped_packets_client2_to_client1 += 1
+                                direction = "Client2->Client1"
+                            print(f"Dropped packet ({direction})")
                         else:
                             dest_port = self.args.client2_listen if sock == sock1 else self.args.client1_listen
                             target_sock = sock2 if sock == sock1 else sock1
                             target_sock.sendto(data, ('localhost', dest_port))
                             self.sent_packets += 1
-                            print(f"Forwarded {len(data)} bytes from {'Client1' if sock == sock1 else 'Client2'} "
-                                  f"to port {dest_port}")
+                            direction = "Client1->Client2" if sock == sock1 else "Client2->Client1"
+                            print(f"Forwarded {len(data)} bytes ({
+                                  direction}) to port {dest_port}")
 
-                        print(f"Stats: Sent={self.sent_packets}, Dropped={
-                              self.dropped_packets}")
+                        self.print_stats()
 
         except KeyboardInterrupt:
             self.print_final_stats()
@@ -72,12 +77,15 @@ class Proxy:
             def forward(src, dst, direction):
                 try:
                     while True:
-                        data = src.recv(4096)
+                        data = src.recv(3)
                         if not data:
                             break
                         with self.lock:
                             if random.random() < self.args.drop_rate:
-                                self.dropped_packets += 1
+                                if direction == 'outgoing':
+                                    self.dropped_packets_client1_to_client2 += 1
+                                else:
+                                    self.dropped_packets_client2_to_client1 += 1
                                 print(
                                     f"Dropped {direction} packet ({len(data)} bytes)")
                             else:
@@ -85,8 +93,7 @@ class Proxy:
                                 self.sent_packets += 1
                                 print(f"Forwarded {
                                       direction} packet ({len(data)} bytes)")
-                            print(f"Stats: Sent={self.sent_packets}, Dropped={
-                                  self.dropped_packets}")
+                            self.print_stats()
                 except Exception as e:
                     print(f"Connection error: {e}")
                 finally:
@@ -125,10 +132,18 @@ class Proxy:
         except KeyboardInterrupt:
             self.print_final_stats()
 
+    def print_stats(self):
+        print(f"Stats: Sent={self.sent_packets}, "
+              f"Dropped(C1->C2)={self.dropped_packets_client1_to_client2}, "
+              f"Dropped(C2->C1)={self.dropped_packets_client2_to_client1}")
+
     def print_final_stats(self):
         print("\n=== Final Statistics ===")
         print(f"Total packets sent: {self.sent_packets}")
-        print(f"Total packets dropped: {self.dropped_packets}")
+        print(
+            f"Total packets dropped (Client1->Client2): {self.dropped_packets_client1_to_client2}")
+        print(
+            f"Total packets dropped (Client2->Client1): {self.dropped_packets_client2_to_client1}")
 
 
 if __name__ == "__main__":
@@ -147,6 +162,8 @@ if __name__ == "__main__":
                         help='Packet drop rate (0.0-1.0)')
 
     args = parser.parse_args()
+
+    random.seed(123)
 
     if not (0 <= args.drop_rate <= 1):
         print("Error: Drop rate must be between 0 and 1")
