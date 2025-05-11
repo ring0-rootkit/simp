@@ -50,7 +50,12 @@ class Proxy:
                         else:
                             dest_port = self.args.client2_listen if sock == sock1 else self.args.client1_listen
                             target_sock = sock2 if sock == sock1 else sock1
-                            target_sock.sendto(data, ('localhost', dest_port))
+                            if dest_port == 5001:
+                                target_sock.sendto(
+                                    data, ('192.168.100.92', dest_port))
+                            else:
+                                target_sock.sendto(
+                                    data, ('localhost', dest_port))
                             self.sent_packets += 1
                             direction = "Client1->Client2" if sock == sock1 else "Client2->Client1"
                             print(f"Forwarded {len(data)} bytes ({

@@ -32,14 +32,13 @@ int main(void) {
   printf("before send\n");
   for (int i = 0; i < 1000; i++) {
     snprintf(buffer, sizeof(buffer), "%d", i);
-    err = simp_send(ctx, (const uint8_t *)buffer, 5, PRIO_HIGH, 1);
+    err = simp_send(ctx, (const uint8_t *)buffer, 5, PRIO_LOW, 1);
     if (err < 0) {
       perror("send");
       simp_cleanup(ctx);
       return 1;
     }
-    usleep(100000);
+    usleep(10000);
   }
-  while(simp_is_connected(ctx)){usleep(1000);}
   simp_cleanup(ctx);
 }

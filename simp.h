@@ -65,6 +65,7 @@ typedef enum {
 typedef struct {
     uint8_t version : 4;
     uint8_t reserved : 4;
+    uint8_t resend_bitmap;
     uint8_t group_id;
     uint16_t seq_id;
     uint16_t ack_id;

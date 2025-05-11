@@ -3,8 +3,8 @@ TMUX_PANE_0 := $(shell tmux list-panes -t $(TMUX_CURRENT_WINDOW) -F '#{pane_id}'
 TMUX_PANE_1 := $(shell tmux list-panes -t $(TMUX_CURRENT_WINDOW) -F '#{pane_id}' | tail -n 1)
 
 all:
-	clang server.c -o server -pthread -lrt
-	clang client.c -o client -pthread -lrt
+	clang server.c -O3 -o server -pthread -lrt
+	clang client.c -O3 -o client -pthread -lrt
 
 run: all run-server run-client
 

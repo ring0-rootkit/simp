@@ -10,7 +10,7 @@ int main(void) {
     return 1;
   }
 
-  int err = simp_init(ctx, "127.0.0.1", 6000);
+  int err = simp_init(ctx, "0.0.0.0", 5000);
   if (err) {
     perror("cannot init");
     simp_cleanup(ctx);
@@ -26,6 +26,7 @@ int main(void) {
   }
 
   char buf[128];
+  int counter = 0;
   for (int i = 0; i < 1000; i++) {
     int len = simp_recv(ctx, buf, 128);
     if (len < 0) {
@@ -33,14 +34,14 @@ int main(void) {
       simp_cleanup(ctx);
       return 1;
     }
-    if (i != atoi(buf)) {
-      printf("messages are out of order!\n");
-      printf("recieved: %d, expected: %d\n", atoi(buf), i);
-      simp_cleanup(ctx);
-      return 1;
+    counter++;
+    if (strcmp(buf, "999") == 0) {
+      break;
     }
-    printf("%.*s\n", len, buf);
+    printf("%3s\n", buf);
   }
+
+  printf("received %d messages\n", counter);
 
   simp_cleanup(ctx);
   
